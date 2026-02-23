@@ -155,6 +155,8 @@ struct ChannelRouteSelection {
 enum ChannelRuntimeCommand {
     ShowStatus,
     ShowChannels,
+    ShowUsage,
+    CompactConversation,
     ShowProviders,
     SetProvider(String),
     ShowModels,
@@ -235,6 +237,28 @@ fn in_flight_sender_store() -> &'static tokio::sync::Mutex<HashMap<String, InFli
     static STORE: OnceLock<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>> =
         OnceLock::new();
     STORE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+#[derive(Debug, Clone)]
+struct ChannelUsageSnapshot {
+    provider: String,
+    model: String,
+    reasoning_enabled: Option<bool>,
+    reasoning_effort: Option<String>,
+    history_messages: usize,
+    context_chars: usize,
+    est_context_tokens: u64,
+    last_response_chars: usize,
+    est_last_response_tokens: u64,
+    est_total_input_tokens: u64,
+    est_total_output_tokens: u64,
+    turns_completed: u64,
+    updated_at: SystemTime,
+}
+
+fn usage_store() -> &'static Mutex<HashMap<String, ChannelUsageSnapshot>> {
+    static STORE: OnceLock<Mutex<HashMap<String, ChannelUsageSnapshot>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "zeroclaw.service"];
@@ -732,6 +756,8 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         "/approve" => Some(ChannelRuntimeCommand::ApproveTool(tail.clone())),
         "/unapprove" => Some(ChannelRuntimeCommand::UnapproveTool(tail.clone())),
         "/approvals" => Some(ChannelRuntimeCommand::ListApprovals),
+        "/usage" => Some(ChannelRuntimeCommand::ShowUsage),
+        "/compact" => Some(ChannelRuntimeCommand::CompactConversation),
         "/providers" => {
             if tail.is_empty() {
                 Some(ChannelRuntimeCommand::ShowProviders)
@@ -1674,6 +1700,10 @@ fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(sender_key);
+    usage_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(sender_key);
 }
 
 fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
@@ -2012,6 +2042,59 @@ fn build_status_response(ctx: &ChannelRuntimeContext, current: &ChannelRouteSele
     )
 }
 
+fn estimate_tokens_from_chars(chars: usize) -> u64 {
+    (chars as u64).div_ceil(4)
+}
+
+fn build_usage_response(sender_key: &str, current: &ChannelRouteSelection) -> String {
+    let maybe_usage = usage_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(sender_key)
+        .cloned();
+
+    let thinking = match current.reasoning_enabled {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "auto",
+    };
+    let effort = current.reasoning_effort.as_deref().unwrap_or("auto");
+
+    let Some(usage) = maybe_usage else {
+        return format!(
+            "Usage snapshot for this session:\nProvider: `{}`\nModel: `{}`\nReasoning: `{}` (effort: `{}`)\nNo usage recorded yet for this sender.",
+            current.provider, current.model, thinking, effort
+        );
+    };
+
+    let updated_epoch = usage
+        .updated_at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+
+    format!(
+        "Usage snapshot for this session:\nProvider: `{}`\nModel: `{}`\nReasoning: `{}` (effort: `{}`)\nTurns completed: {}\nHistory messages: {}\nContext size: {} chars (~{} tokens)\nLast response: {} chars (~{} tokens)\nEstimated token totals: input={} output={} total={}\nUpdated at (unix): {}",
+        usage.provider,
+        usage.model,
+        match usage.reasoning_enabled {
+            Some(true) => "on",
+            Some(false) => "off",
+            None => "auto",
+        },
+        usage.reasoning_effort.as_deref().unwrap_or("auto"),
+        usage.turns_completed,
+        usage.history_messages,
+        usage.context_chars,
+        usage.est_context_tokens,
+        usage.last_response_chars,
+        usage.est_last_response_tokens,
+        usage.est_total_input_tokens,
+        usage.est_total_output_tokens,
+        usage.est_total_input_tokens.saturating_add(usage.est_total_output_tokens),
+        updated_epoch
+    )
+}
+
 fn supported_reasoning_efforts_for_model(model: &str) -> &'static [&'static str] {
     let id = model
         .rsplit('/')
@@ -2202,6 +2285,15 @@ async fn handle_runtime_command_if_needed(
     let response = match command {
         ChannelRuntimeCommand::ShowStatus => build_status_response(ctx, &current),
         ChannelRuntimeCommand::ShowChannels => build_channels_help_response(ctx),
+        ChannelRuntimeCommand::ShowUsage => build_usage_response(&sender_key, &current),
+        ChannelRuntimeCommand::CompactConversation => {
+            let compacted = compact_sender_history(ctx, &sender_key);
+            if compacted {
+                "Conversation context compacted for this session.".to_string()
+            } else {
+                "Nothing to compact for this session yet.".to_string()
+            }
+        }
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
             match resolve_provider_alias(&raw_provider) {
@@ -3716,6 +3808,50 @@ or tune thresholds in config.",
             }
         }
         LlmExecutionResult::Completed(Ok(Ok(response))) => {
+            let context_chars: usize = history.iter().map(|m| m.content.chars().count()).sum();
+            let last_response_chars = response.chars().count();
+            let est_context_tokens = estimate_tokens_from_chars(context_chars);
+            let est_last_response_tokens = estimate_tokens_from_chars(last_response_chars);
+            {
+                let mut usage_map = usage_store().lock().unwrap_or_else(|e| e.into_inner());
+                let usage_entry =
+                    usage_map
+                        .entry(history_key.clone())
+                        .or_insert_with(|| ChannelUsageSnapshot {
+                            provider: route.provider.clone(),
+                            model: route.model.clone(),
+                            reasoning_enabled: route.reasoning_enabled,
+                            reasoning_effort: route.reasoning_effort.clone(),
+                            history_messages: history.len(),
+                            context_chars,
+                            est_context_tokens,
+                            last_response_chars,
+                            est_last_response_tokens,
+                            est_total_input_tokens: 0,
+                            est_total_output_tokens: 0,
+                            turns_completed: 0,
+                            updated_at: SystemTime::now(),
+                        });
+
+                usage_entry.provider = route.provider.clone();
+                usage_entry.model = route.model.clone();
+                usage_entry.reasoning_enabled = route.reasoning_enabled;
+                usage_entry.reasoning_effort = route.reasoning_effort.clone();
+                usage_entry.history_messages = history.len();
+                usage_entry.context_chars = context_chars;
+                usage_entry.est_context_tokens = est_context_tokens;
+                usage_entry.last_response_chars = last_response_chars;
+                usage_entry.est_last_response_tokens = est_last_response_tokens;
+                usage_entry.est_total_input_tokens = usage_entry
+                    .est_total_input_tokens
+                    .saturating_add(est_context_tokens);
+                usage_entry.est_total_output_tokens = usage_entry
+                    .est_total_output_tokens
+                    .saturating_add(est_last_response_tokens);
+                usage_entry.turns_completed = usage_entry.turns_completed.saturating_add(1);
+                usage_entry.updated_at = SystemTime::now();
+            }
+
             // ── Hook: on_message_sending (modifying) ─────────
             let mut outbound_response = response;
             if let Some(hooks) = &ctx.hooks {
@@ -10631,6 +10767,14 @@ BTC is currently around $65,000 based on latest tool output."#;
         assert_eq!(
             parse_runtime_command("telegram", "/channels"),
             Some(ChannelRuntimeCommand::ShowChannels)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/usage"),
+            Some(ChannelRuntimeCommand::ShowUsage)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/compact"),
+            Some(ChannelRuntimeCommand::CompactConversation)
         );
         assert_eq!(
             parse_runtime_command("telegram", "/models"),

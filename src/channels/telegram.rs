@@ -17,7 +17,6 @@ const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 /// Reserve space for continuation markers added by send_text_chunks:
 /// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 30 extra chars
 const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
-<<<<<<< HEAD
 const TELEGRAM_ACK_REACTIONS: &[&str] = &["👀"];
 
 /// Metadata for an incoming document or photo attachment.
