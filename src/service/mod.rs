@@ -1,9 +1,12 @@
 use crate::config::Config;
 use anyhow::{bail, Context, Result};
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 const SERVICE_LABEL: &str = "com.zeroclaw.daemon";
 const WINDOWS_TASK_NAME: &str = "ZeroClaw Daemon";
@@ -123,14 +126,16 @@ fn start(config: &Config, init_system: InitSystem) -> Result<()> {
         run_checked(Command::new("launchctl").arg("load").arg("-w").arg(&plist))?;
         run_checked(Command::new("launchctl").arg("start").arg(SERVICE_LABEL))?;
         println!("✅ Service started");
+        report_dashboard_status(config);
         Ok(())
     } else if cfg!(target_os = "linux") {
         let resolved = init_system.resolve()?;
-        start_linux(resolved)
+        start_linux(config, resolved)
     } else if cfg!(target_os = "windows") {
         let _ = config;
         run_checked(Command::new("schtasks").args(["/Run", "/TN", windows_task_name()]))?;
         println!("✅ Service started");
+        report_dashboard_status(config);
         Ok(())
     } else {
         let _ = config;
@@ -138,7 +143,7 @@ fn start(config: &Config, init_system: InitSystem) -> Result<()> {
     }
 }
 
-fn start_linux(init_system: InitSystem) -> Result<()> {
+fn start_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
             run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
@@ -150,6 +155,7 @@ fn start_linux(init_system: InitSystem) -> Result<()> {
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
     println!("✅ Service started");
+    report_dashboard_status(config);
     Ok(())
 }
 
@@ -302,7 +308,88 @@ fn status_linux(config: &Config, init_system: InitSystem) -> Result<()> {
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
+    println!("Dashboard URL: {}", dashboard_url(config));
     Ok(())
+}
+
+fn report_dashboard_status(config: &Config) {
+    let url = dashboard_url(config);
+    match wait_for_dashboard(config, Duration::from_secs(15)) {
+        Ok(()) => println!("🌐 Dashboard: {url}"),
+        Err(err) => eprintln!("⚠️  Dashboard not reachable yet at {url} ({err})"),
+    }
+}
+
+fn dashboard_url(config: &Config) -> String {
+    let host = normalize_dashboard_host(&config.gateway.host);
+    format!("http://{host}:{}", config.gateway.port)
+}
+
+fn normalize_dashboard_host(host: &str) -> &str {
+    match host {
+        "0.0.0.0" => "127.0.0.1",
+        "::" | "[::]" => "::1",
+        _ => host,
+    }
+}
+
+fn wait_for_dashboard(config: &Config, timeout: Duration) -> Result<()> {
+    let host = normalize_dashboard_host(&config.gateway.host);
+    let addr = resolve_first_addr(host, config.gateway.port)
+        .with_context(|| format!("failed to resolve dashboard host '{host}'"))?;
+    let deadline = Instant::now() + timeout;
+    let mut last_error = String::from("unknown error");
+
+    while Instant::now() < deadline {
+        match check_http_get(addr, host, "/health") {
+            Ok(()) => return Ok(()),
+            Err(err) => last_error = err.to_string(),
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    bail!("{last_error}");
+}
+
+fn resolve_first_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    (host, port)
+        .to_socket_addrs()?
+        .next()
+        .context("no socket address resolved")
+}
+
+fn check_http_get(addr: SocketAddr, host: &str, path: &str) -> Result<()> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(400))
+        .with_context(|| format!("tcp connect to {addr} failed"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(400)))
+        .context("failed to set read timeout")?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(400)))
+        .context("failed to set write timeout")?;
+
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .context("failed to write HTTP request")?;
+
+    let mut buf = [0_u8; 128];
+    let n = stream
+        .read(&mut buf)
+        .context("failed to read HTTP response")?;
+    if n == 0 {
+        bail!("empty HTTP response from {}", addr);
+    }
+    let head = String::from_utf8_lossy(&buf[..n]);
+    if head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.1 204") {
+        return Ok(());
+    }
+
+    bail!(
+        "unexpected response status from {}: {}",
+        addr,
+        head.lines().next().unwrap_or("unknown")
+    )
 }
 
 fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
