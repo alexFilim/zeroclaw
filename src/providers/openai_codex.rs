@@ -221,39 +221,31 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<ResponsesInpu
             "system" => system_parts.push(&msg.content),
             "user" => {
                 let (cleaned_text, image_refs) = multimodal::parse_image_markers(&msg.content);
-
-                let mut content_items = Vec::new();
-
-                // Add text if present
+                let mut content = Vec::new();
                 if !cleaned_text.trim().is_empty() {
-                    content_items.push(ResponsesInputContent {
+                    content.push(ResponsesInputContent {
                         kind: "input_text".to_string(),
                         text: Some(cleaned_text),
                         image_url: None,
                     });
                 }
-
-                // Add images
                 for image_ref in image_refs {
-                    content_items.push(ResponsesInputContent {
+                    content.push(ResponsesInputContent {
                         kind: "input_image".to_string(),
                         text: None,
                         image_url: Some(image_ref),
                     });
                 }
-
-                // If no content at all, add empty text
-                if content_items.is_empty() {
-                    content_items.push(ResponsesInputContent {
+                if content.is_empty() {
+                    content.push(ResponsesInputContent {
                         kind: "input_text".to_string(),
-                        text: Some(String::new()),
+                        text: Some(msg.content.clone()),
                         image_url: None,
                     });
                 }
-
                 input.push(ResponsesInput {
                     role: "user".to_string(),
-                    content: content_items,
+                    content,
                 });
             }
             "assistant" => {
@@ -691,6 +683,7 @@ impl Provider for OpenAiCodexProvider {
         self.send_responses_request(input, instructions, model)
             .await
     }
+
 }
 
 #[cfg(test)]
@@ -752,6 +745,24 @@ mod tests {
             output_text: None,
         };
         assert_eq!(extract_responses_text(&response).as_deref(), Some("nested"));
+    }
+
+    #[test]
+    fn build_responses_input_converts_image_markers_to_input_image_blocks() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Describe this\n\n[IMAGE:data:image/png;base64,abcd]".to_string(),
+        }];
+
+        let (_, input) = build_responses_input(&messages);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0].content.len(), 2);
+        assert_eq!(input[0].content[0].kind, "input_text");
+        assert_eq!(input[0].content[1].kind, "input_image");
+        assert_eq!(
+            input[0].content[1].image_url.as_deref(),
+            Some("data:image/png;base64,abcd")
+        );
     }
 
     #[test]
