@@ -15,6 +15,7 @@ const DEFAULT_CODEX_INSTRUCTIONS: &str =
 pub struct OpenAiCodexProvider {
     auth: AuthService,
     auth_profile_override: Option<String>,
+    reasoning_effort_override: Option<String>,
     client: Client,
 }
 
@@ -88,6 +89,7 @@ impl OpenAiCodexProvider {
         Self {
             auth,
             auth_profile_override: options.auth_profile_override.clone(),
+            reasoning_effort_override: options.reasoning_effort.clone(),
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .connect_timeout(std::time::Duration::from_secs(10))
@@ -191,10 +193,14 @@ fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
     effort.to_string()
 }
 
-fn resolve_reasoning_effort(model_id: &str) -> String {
-    let raw = std::env::var("ZEROCLAW_CODEX_REASONING_EFFORT")
-        .ok()
-        .and_then(|value| first_nonempty(Some(&value)))
+fn resolve_reasoning_effort(model_id: &str, override_effort: Option<&str>) -> String {
+    let raw = override_effort
+        .and_then(|value| first_nonempty(Some(value)))
+        .or_else(|| {
+            std::env::var("ZEROCLAW_CODEX_REASONING_EFFORT")
+                .ok()
+                .and_then(|value| first_nonempty(Some(&value)))
+        })
         .unwrap_or_else(|| "xhigh".to_string())
         .to_ascii_lowercase();
     clamp_reasoning_effort(model_id, &raw)
@@ -425,7 +431,10 @@ impl OpenAiCodexProvider {
                 verbosity: "medium".to_string(),
             },
             reasoning: ResponsesReasoningOptions {
-                effort: resolve_reasoning_effort(normalized_model),
+                effort: resolve_reasoning_effort(
+                    normalized_model,
+                    self.reasoning_effort_override.as_deref(),
+                ),
                 summary: "auto".to_string(),
             },
             include: vec!["reasoning.encrypted_content".to_string()],
@@ -579,6 +588,18 @@ mod tests {
         );
         assert_eq!(
             clamp_reasoning_effort("gpt-5.3-codex", "xhigh"),
+            "xhigh".to_string()
+        );
+    }
+
+    #[test]
+    fn resolve_reasoning_effort_prefers_runtime_override() {
+        assert_eq!(
+            resolve_reasoning_effort("gpt-5-codex", Some("minimal")),
+            "low".to_string()
+        );
+        assert_eq!(
+            resolve_reasoning_effort("gpt-5.3-codex", Some("xhigh")),
             "xhigh".to_string()
         );
     }

@@ -143,14 +143,22 @@ fn channel_message_timeout_budget_secs(
 struct ChannelRouteSelection {
     provider: String,
     model: String,
+    reasoning_enabled: Option<bool>,
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChannelRuntimeCommand {
+    ShowStatus,
+    ShowChannels,
     ShowProviders,
     SetProvider(String),
-    ShowModel,
+    ShowModels,
     SetModel(String),
+    ShowThink,
+    SetThink(Option<bool>),
+    SetThinkEffort(String),
+    RestartService,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -168,6 +176,8 @@ struct ModelCacheEntry {
 struct ChannelRuntimeDefaults {
     default_provider: String,
     model: String,
+    reasoning_enabled: Option<bool>,
+    reasoning_effort: Option<String>,
     temperature: f64,
     api_key: Option<String>,
     api_url: Option<String>,
@@ -189,6 +199,13 @@ struct RuntimeConfigState {
 fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>> {
     static STORE: OnceLock<Mutex<HashMap<PathBuf, RuntimeConfigState>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn in_flight_sender_store() -> &'static tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>
+{
+    static STORE: OnceLock<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>> =
+        OnceLock::new();
+    STORE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
 const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "zeroclaw.service"];
@@ -474,7 +491,9 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         .to_ascii_lowercase();
 
     match base_command.as_str() {
-        "/models" => {
+        "/status" => Some(ChannelRuntimeCommand::ShowStatus),
+        "/channels" => Some(ChannelRuntimeCommand::ShowChannels),
+        "/providers" => {
             if let Some(provider) = parts.next() {
                 Some(ChannelRuntimeCommand::SetProvider(
                     provider.trim().to_string(),
@@ -483,16 +502,75 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::ShowProviders)
             }
         }
+        "/provider" => {
+            if let Some(provider) = parts.next() {
+                Some(ChannelRuntimeCommand::SetProvider(
+                    provider.trim().to_string(),
+                ))
+            } else {
+                Some(ChannelRuntimeCommand::ShowProviders)
+            }
+        }
+        "/models" => {
+            let value = parts.collect::<Vec<_>>().join(" ").trim().to_string();
+            if value.is_empty() {
+                Some(ChannelRuntimeCommand::ShowModels)
+            } else {
+                Some(ChannelRuntimeCommand::SetModel(value))
+            }
+        }
         "/model" => {
             let model = parts.collect::<Vec<_>>().join(" ").trim().to_string();
             if model.is_empty() {
-                Some(ChannelRuntimeCommand::ShowModel)
+                Some(ChannelRuntimeCommand::ShowModels)
             } else {
                 Some(ChannelRuntimeCommand::SetModel(model))
             }
         }
+        "/think" => {
+            let value = parts.next().map(|s| s.trim().to_ascii_lowercase());
+            match value.as_deref() {
+                None | Some("") => Some(ChannelRuntimeCommand::ShowThink),
+                Some("on" | "deep" | "true" | "1") => {
+                    Some(ChannelRuntimeCommand::SetThink(Some(true)))
+                }
+                Some("off" | "fast" | "false" | "0") => {
+                    Some(ChannelRuntimeCommand::SetThink(Some(false)))
+                }
+                Some("auto" | "default" | "normal" | "reset") => {
+                    Some(ChannelRuntimeCommand::SetThink(None))
+                }
+                Some("minimal" | "low" | "medium" | "high" | "xhigh") => Some(
+                    ChannelRuntimeCommand::SetThinkEffort(value.unwrap_or_default()),
+                ),
+                _ => Some(ChannelRuntimeCommand::ShowThink),
+            }
+        }
+        "/restart" => Some(ChannelRuntimeCommand::RestartService),
         _ => None,
     }
+}
+
+fn is_abort_runtime_command(channel_name: &str, content: &str) -> bool {
+    if !supports_runtime_model_switch(channel_name) {
+        return false;
+    }
+
+    let trimmed = content.trim();
+    if !trimmed.starts_with('/') {
+        return false;
+    }
+
+    let command = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .split('@')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    command == "/abort"
 }
 
 fn resolve_provider_alias(name: &str) -> Option<String> {
@@ -534,6 +612,8 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
     ChannelRuntimeDefaults {
         default_provider: resolved_default_provider(config),
         model: resolved_default_model(config),
+        reasoning_enabled: config.runtime.reasoning_enabled,
+        reasoning_effort: None,
         temperature: config.default_temperature,
         api_key: config.api_key.clone(),
         api_url: config.api_url.clone(),
@@ -561,6 +641,8 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
     ChannelRuntimeDefaults {
         default_provider: ctx.default_provider.as_str().to_string(),
         model: ctx.model.as_str().to_string(),
+        reasoning_enabled: ctx.provider_runtime_options.reasoning_enabled,
+        reasoning_effort: ctx.provider_runtime_options.reasoning_effort.clone(),
         temperature: ctx.temperature,
         api_key: ctx.api_key.clone(),
         api_url: ctx.api_url.clone(),
@@ -632,12 +714,14 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     }
 
     let next_defaults = load_runtime_defaults_from_config_file(&config_path).await?;
+    let mut runtime_options = ctx.provider_runtime_options.clone();
+    runtime_options.reasoning_enabled = next_defaults.reasoning_enabled;
     let next_default_provider = providers::create_resilient_provider_with_options(
         &next_defaults.default_provider,
         next_defaults.api_key.as_deref(),
         next_defaults.api_url.as_deref(),
         &next_defaults.reliability,
-        &ctx.provider_runtime_options,
+        &runtime_options,
     )?;
     let next_default_provider: Arc<dyn Provider> = Arc::from(next_default_provider);
 
@@ -652,7 +736,11 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         let mut cache = ctx.provider_cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.clear();
         cache.insert(
-            next_defaults.default_provider.clone(),
+            provider_cache_key(
+                &next_defaults.default_provider,
+                next_defaults.reasoning_enabled,
+                next_defaults.reasoning_effort.as_deref(),
+            ),
             Arc::clone(&next_default_provider),
         );
     }
@@ -686,6 +774,8 @@ fn default_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection
     ChannelRouteSelection {
         provider: defaults.default_provider,
         model: defaults.model,
+        reasoning_enabled: defaults.reasoning_enabled,
+        reasoning_effort: defaults.reasoning_effort,
     }
 }
 
@@ -843,22 +933,35 @@ fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<S
         .unwrap_or_default()
 }
 
+fn provider_cache_key(
+    provider_name: &str,
+    reasoning_enabled: Option<bool>,
+    reasoning_effort: Option<&str>,
+) -> String {
+    let enabled_suffix = match reasoning_enabled {
+        Some(true) => "think:on",
+        Some(false) => "think:off",
+        None => "think:auto",
+    };
+    let effort_suffix = reasoning_effort.unwrap_or("effort:auto");
+    format!("{provider_name}|{enabled_suffix}|{effort_suffix}")
+}
+
 async fn get_or_create_provider(
     ctx: &ChannelRuntimeContext,
     provider_name: &str,
+    reasoning_enabled: Option<bool>,
+    reasoning_effort: Option<&str>,
 ) -> anyhow::Result<Arc<dyn Provider>> {
+    let cache_key = provider_cache_key(provider_name, reasoning_enabled, reasoning_effort);
     if let Some(existing) = ctx
         .provider_cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(provider_name)
+        .get(&cache_key)
         .cloned()
     {
         return Ok(existing);
-    }
-
-    if provider_name == ctx.default_provider.as_str() {
-        return Ok(Arc::clone(&ctx.provider));
     }
 
     let defaults = runtime_defaults_snapshot(ctx);
@@ -868,12 +971,16 @@ async fn get_or_create_provider(
         None
     };
 
+    let mut provider_runtime_options = ctx.provider_runtime_options.clone();
+    provider_runtime_options.reasoning_enabled = reasoning_enabled;
+    provider_runtime_options.reasoning_effort = reasoning_effort.map(ToString::to_string);
+
     let provider = create_resilient_provider_nonblocking(
         provider_name,
         ctx.api_key.clone(),
         api_url.map(ToString::to_string),
         ctx.reliability.as_ref().clone(),
-        ctx.provider_runtime_options.clone(),
+        provider_runtime_options,
     )
     .await?;
     let provider: Arc<dyn Provider> = Arc::from(provider);
@@ -884,7 +991,7 @@ async fn get_or_create_provider(
 
     let mut cache = ctx.provider_cache.lock().unwrap_or_else(|e| e.into_inner());
     let cached = cache
-        .entry(provider_name.to_string())
+        .entry(cache_key)
         .or_insert_with(|| Arc::clone(&provider));
     Ok(Arc::clone(cached))
 }
@@ -912,12 +1019,18 @@ async fn create_resilient_provider_nonblocking(
 
 fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &Path) -> String {
     let mut response = String::new();
+    let think_level = match current.reasoning_enabled {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "auto",
+    };
     let _ = writeln!(
         response,
-        "Current provider: `{}`\nCurrent model: `{}`",
-        current.provider, current.model
+        "Current provider: `{}`\nCurrent model: `{}`\nReasoning: `{}`",
+        current.provider, current.model, think_level
     );
-    response.push_str("\nSwitch model with `/model <model-id>`.\n");
+    response.push_str("\nSwitch model with `/models <model-id>` or `/model <model-id>`.\n");
+    response.push_str("Switch provider with `/provider <provider>`.\n");
 
     let cached_models = load_cached_model_preview(workspace_dir, &current.provider);
     if cached_models.is_empty() {
@@ -947,8 +1060,8 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
         "Current provider: `{}`\nCurrent model: `{}`",
         current.provider, current.model
     );
-    response.push_str("\nSwitch provider with `/models <provider>`.\n");
-    response.push_str("Switch model with `/model <model-id>`.\n\n");
+    response.push_str("\nSwitch provider with `/provider <provider>`.\n");
+    response.push_str("Switch model with `/models <model-id>`.\n\n");
     response.push_str("Available providers:\n");
     for provider in providers::list_providers() {
         if provider.aliases.is_empty() {
@@ -963,6 +1076,103 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
         }
     }
     response
+}
+
+fn build_channels_help_response(ctx: &ChannelRuntimeContext) -> String {
+    let mut channel_names: Vec<_> = ctx.channels_by_name.keys().cloned().collect();
+    channel_names.sort();
+    let mut response = String::from("Active channels:\n");
+    for name in channel_names {
+        let _ = writeln!(response, "- {name}");
+    }
+    response
+}
+
+fn build_status_response(ctx: &ChannelRuntimeContext, current: &ChannelRouteSelection) -> String {
+    let snapshot = crate::health::snapshot();
+    let channels_total = ctx.channels_by_name.len();
+    let channels_healthy = snapshot
+        .components
+        .iter()
+        .filter(|(name, state)| name.starts_with("channel:") && state.status == "ok")
+        .count();
+    let thinking = match current.reasoning_enabled {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "auto",
+    };
+
+    format!(
+        "ZeroClaw status: running\nUptime: {}s\nPID: {}\nChannels: {}/{} healthy\nProvider: `{}`\nModel: `{}`\nReasoning: `{}`",
+        snapshot.uptime_seconds,
+        snapshot.pid,
+        channels_healthy,
+        channels_total,
+        current.provider,
+        current.model,
+        thinking
+    )
+}
+
+fn supported_reasoning_efforts_for_model(model: &str) -> &'static [&'static str] {
+    let id = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    if id == "gpt-5-codex" {
+        &["low", "medium", "high"]
+    } else if id.starts_with("gpt-5.2") || id.starts_with("gpt-5.3") || id == "gpt-5.1" {
+        &["low", "medium", "high", "xhigh"]
+    } else if id == "gpt-5.1-codex-mini" {
+        &["medium", "high"]
+    } else {
+        &["minimal", "low", "medium", "high", "xhigh"]
+    }
+}
+
+fn normalize_reasoning_effort_for_model(model: &str, requested: &str) -> Option<String> {
+    let effort = requested.trim().to_ascii_lowercase();
+    if effort.is_empty() {
+        return None;
+    }
+
+    let mut normalized = match effort.as_str() {
+        "minimal" => "minimal".to_string(),
+        "low" => "low".to_string(),
+        "medium" => "medium".to_string(),
+        "high" => "high".to_string(),
+        "xhigh" => "xhigh".to_string(),
+        _ => return None,
+    };
+
+    let allowed = supported_reasoning_efforts_for_model(model);
+    if allowed.iter().any(|v| *v == normalized) {
+        return Some(normalized);
+    }
+
+    normalized = match normalized.as_str() {
+        "minimal" if allowed.contains(&"low") => "low".to_string(),
+        "xhigh" if allowed.contains(&"high") => "high".to_string(),
+        "low" if allowed.contains(&"medium") => "medium".to_string(),
+        _ => return None,
+    };
+
+    Some(normalized)
+}
+
+fn build_think_response(current: &ChannelRouteSelection) -> String {
+    let level = match current.reasoning_enabled {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "auto",
+    };
+    let effort = current.reasoning_effort.as_deref().unwrap_or("auto");
+    let allowed = supported_reasoning_efforts_for_model(&current.model).join(", ");
+    format!(
+        "Current reasoning mode: `{level}`.\nCurrent effort: `{effort}`.\nSupported effort levels for `{}`: `{}`.\nUse `/think on`, `/think off`, `/think auto`, or `/think <level>`.",
+        current.model, allowed
+    )
 }
 
 async fn handle_runtime_command_if_needed(
@@ -982,19 +1192,71 @@ async fn handle_runtime_command_if_needed(
     let mut current = get_route_selection(ctx, &sender_key);
 
     let response = match command {
+        ChannelRuntimeCommand::ShowStatus => build_status_response(ctx, &current),
+        ChannelRuntimeCommand::ShowChannels => build_channels_help_response(ctx),
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
             match resolve_provider_alias(&raw_provider) {
-                Some(provider_name) => match get_or_create_provider(ctx, &provider_name).await {
+                Some(provider_name) => {
+                    match get_or_create_provider(
+                        ctx,
+                        &provider_name,
+                        current.reasoning_enabled,
+                        current.reasoning_effort.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            if provider_name != current.provider {
+                                current.provider = provider_name.clone();
+                                set_route_selection(ctx, &sender_key, current.clone());
+                                clear_sender_history(ctx, &sender_key);
+                            }
+
+                            format!(
+                            "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
+                            current.model
+                        )
+                        }
+                        Err(err) => {
+                            let safe_err = providers::sanitize_api_error(&err.to_string());
+                            format!(
+                            "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
+                        )
+                        }
+                    }
+                }
+                None => format!(
+                    "Unknown provider `{raw_provider}`. Use `/providers` to list valid providers."
+                ),
+            }
+        }
+        ChannelRuntimeCommand::ShowModels => {
+            build_models_help_response(&current, ctx.workspace_dir.as_path())
+        }
+        ChannelRuntimeCommand::SetModel(raw_model) => {
+            let model = raw_model.trim().trim_matches('`').to_string();
+            if model.is_empty() && msg.content.trim_start().starts_with("/models") {
+                build_models_help_response(&current, ctx.workspace_dir.as_path())
+            } else if model.is_empty() {
+                "Model ID cannot be empty. Use `/model <model-id>`.".to_string()
+            } else if let Some(provider_name) = resolve_provider_alias(&model) {
+                match get_or_create_provider(
+                    ctx,
+                    &provider_name,
+                    current.reasoning_enabled,
+                    current.reasoning_effort.as_deref(),
+                )
+                .await
+                {
                     Ok(_) => {
                         if provider_name != current.provider {
                             current.provider = provider_name.clone();
                             set_route_selection(ctx, &sender_key, current.clone());
                             clear_sender_history(ctx, &sender_key);
                         }
-
                         format!(
-                            "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
+                            "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/models` to list models.",
                             current.model
                         )
                     }
@@ -1004,21 +1266,13 @@ async fn handle_runtime_command_if_needed(
                             "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
                         )
                     }
-                },
-                None => format!(
-                    "Unknown provider `{raw_provider}`. Use `/models` to list valid providers."
-                ),
-            }
-        }
-        ChannelRuntimeCommand::ShowModel => {
-            build_models_help_response(&current, ctx.workspace_dir.as_path())
-        }
-        ChannelRuntimeCommand::SetModel(raw_model) => {
-            let model = raw_model.trim().trim_matches('`').to_string();
-            if model.is_empty() {
-                "Model ID cannot be empty. Use `/model <model-id>`.".to_string()
+                }
             } else {
                 current.model = model.clone();
+                if let Some(effort) = current.reasoning_effort.clone() {
+                    current.reasoning_effort =
+                        normalize_reasoning_effort_for_model(&current.model, &effort);
+                }
                 set_route_selection(ctx, &sender_key, current.clone());
                 clear_sender_history(ctx, &sender_key);
 
@@ -1028,6 +1282,53 @@ async fn handle_runtime_command_if_needed(
                 )
             }
         }
+        ChannelRuntimeCommand::ShowThink => build_think_response(&current),
+        ChannelRuntimeCommand::SetThink(next_reasoning_enabled) => {
+            current.reasoning_enabled = next_reasoning_enabled;
+            if next_reasoning_enabled != Some(true) {
+                current.reasoning_effort = None;
+            }
+            set_route_selection(ctx, &sender_key, current.clone());
+            clear_sender_history(ctx, &sender_key);
+            ctx.provider_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            build_think_response(&current)
+        }
+        ChannelRuntimeCommand::SetThinkEffort(requested_effort) => {
+            match normalize_reasoning_effort_for_model(&current.model, &requested_effort) {
+                Some(normalized_effort) => {
+                    current.reasoning_enabled = Some(true);
+                    current.reasoning_effort = Some(normalized_effort.clone());
+                    set_route_selection(ctx, &sender_key, current.clone());
+                    clear_sender_history(ctx, &sender_key);
+                    ctx.provider_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clear();
+                    let allowed = supported_reasoning_efforts_for_model(&current.model).join(", ");
+                    format!(
+                        "Reasoning effort set to `{normalized_effort}` for model `{}`.\nSupported levels for this model: `{}`.",
+                        current.model, allowed
+                    )
+                }
+                None => {
+                    let allowed = supported_reasoning_efforts_for_model(&current.model).join(", ");
+                    format!(
+                        "Reasoning level `{}` is not supported for model `{}`.\nSupported levels: `{}`.",
+                        requested_effort, current.model, allowed
+                    )
+                }
+            }
+        }
+        ChannelRuntimeCommand::RestartService => match maybe_restart_managed_daemon_service() {
+            Ok(true) => "Restart requested. Managed daemon service is restarting now.".to_string(),
+            Ok(false) => {
+                "No managed daemon service detected. Restart manually from terminal.".to_string()
+            }
+            Err(err) => format!("Failed to restart managed daemon service: {err}"),
+        },
     };
 
     if let Err(err) = channel
@@ -1041,6 +1342,33 @@ async fn handle_runtime_command_if_needed(
     }
 
     true
+}
+
+async fn handle_abort_runtime_command(ctx: &ChannelRuntimeContext, msg: &traits::ChannelMessage) {
+    let Some(channel) = ctx.channels_by_name.get(&msg.channel) else {
+        return;
+    };
+
+    let sender_scope_key = interruption_scope_key(msg);
+    let cancelled = {
+        let mut active = in_flight_sender_store().lock().await;
+        active.remove(&sender_scope_key)
+    };
+
+    let response = if let Some(previous) = cancelled {
+        previous.cancellation.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(3), previous.completion.wait()).await;
+        "Abort requested. Stopped the current execution.".to_string()
+    } else {
+        "No active execution to abort.".to_string()
+    };
+
+    if let Err(err) = channel
+        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .await
+    {
+        tracing::warn!("Failed to send abort response on {}: {err}", channel.name());
+    }
 }
 
 async fn build_memory_context(
@@ -1529,12 +1857,19 @@ async fn process_channel_message(
     let history_key = conversation_history_key(&msg);
     let route = get_route_selection(ctx.as_ref(), &history_key);
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
-    let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
+    let active_provider = match get_or_create_provider(
+        ctx.as_ref(),
+        &route.provider,
+        route.reasoning_enabled,
+        route.reasoning_effort.as_deref(),
+    )
+    .await
+    {
         Ok(provider) => provider,
         Err(err) => {
             let safe_err = providers::sanitize_api_error(&err.to_string());
             let message = format!(
-                "⚠️ Failed to initialize provider `{}`. Please run `/models` to choose another provider.\nDetails: {safe_err}",
+                "⚠️ Failed to initialize provider `{}`. Please run `/providers` to choose another provider.\nDetails: {safe_err}",
                 route.provider
             );
             if let Some(channel) = target_channel.as_ref() {
@@ -2083,20 +2418,20 @@ async fn run_message_dispatch_loop(
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let mut workers = tokio::task::JoinSet::new();
-    let in_flight_by_sender = Arc::new(tokio::sync::Mutex::new(HashMap::<
-        String,
-        InFlightSenderTaskState,
-    >::new()));
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
+        if is_abort_runtime_command(&msg.channel, &msg.content) {
+            handle_abort_runtime_command(ctx.as_ref(), &msg).await;
+            continue;
+        }
+
         let permit = match Arc::clone(&semaphore).acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => break,
         };
 
         let worker_ctx = Arc::clone(&ctx);
-        let in_flight = Arc::clone(&in_flight_by_sender);
         let task_sequence = Arc::clone(&task_sequence);
         workers.spawn(async move {
             let _permit = permit;
@@ -2107,19 +2442,19 @@ async fn run_message_dispatch_loop(
             let completion = Arc::new(InFlightTaskCompletion::new());
             let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
 
-            if interrupt_enabled {
-                let previous = {
-                    let mut active = in_flight.lock().await;
-                    active.insert(
-                        sender_scope_key.clone(),
-                        InFlightSenderTaskState {
-                            task_id,
-                            cancellation: cancellation_token.clone(),
-                            completion: Arc::clone(&completion),
-                        },
-                    )
-                };
+            let previous = {
+                let mut active = in_flight_sender_store().lock().await;
+                active.insert(
+                    sender_scope_key.clone(),
+                    InFlightSenderTaskState {
+                        task_id,
+                        cancellation: cancellation_token.clone(),
+                        completion: Arc::clone(&completion),
+                    },
+                )
+            };
 
+            if interrupt_enabled {
                 if let Some(previous) = previous {
                     tracing::info!(
                         channel = %msg.channel,
@@ -2133,14 +2468,12 @@ async fn run_message_dispatch_loop(
 
             process_channel_message(worker_ctx, msg, cancellation_token).await;
 
-            if interrupt_enabled {
-                let mut active = in_flight.lock().await;
-                if active
-                    .get(&sender_scope_key)
-                    .is_some_and(|state| state.task_id == task_id)
-                {
-                    active.remove(&sender_scope_key);
-                }
+            let mut active = in_flight_sender_store().lock().await;
+            if active
+                .get(&sender_scope_key)
+                .is_some_and(|state| state.task_id == task_id)
+            {
+                active.remove(&sender_scope_key);
             }
 
             completion.mark_done();
@@ -3001,6 +3334,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        reasoning_effort: None,
     };
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(
@@ -3246,7 +3580,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
 
     let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-    provider_cache_seed.insert(provider_name.clone(), Arc::clone(&provider));
+    provider_cache_seed.insert(
+        provider_cache_key(&provider_name, config.runtime.reasoning_enabled, None),
+        Arc::clone(&provider),
+    );
     let message_timeout_secs =
         effective_channel_message_timeout_secs(config.channels_config.message_timeout_secs);
     let interrupt_on_new_message = config
@@ -4308,8 +4645,14 @@ BTC is currently around $65,000 based on latest tool output."#
         let fallback_provider: Arc<dyn Provider> = fallback_provider_impl.clone();
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
-        provider_cache_seed.insert("openrouter".to_string(), fallback_provider);
+        provider_cache_seed.insert(
+            provider_cache_key("test-provider", None, None),
+            Arc::clone(&default_provider),
+        );
+        provider_cache_seed.insert(
+            provider_cache_key("openrouter", None, None),
+            fallback_provider,
+        );
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -4387,8 +4730,14 @@ BTC is currently around $65,000 based on latest tool output."#
         let routed_provider: Arc<dyn Provider> = routed_provider_impl.clone();
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
-        provider_cache_seed.insert("openrouter".to_string(), routed_provider);
+        provider_cache_seed.insert(
+            provider_cache_key("test-provider", None, None),
+            Arc::clone(&default_provider),
+        );
+        provider_cache_seed.insert(
+            provider_cache_key("openrouter", None, None),
+            routed_provider,
+        );
 
         let route_key = "telegram_alice".to_string();
         let mut route_overrides = HashMap::new();
@@ -4397,6 +4746,8 @@ BTC is currently around $65,000 based on latest tool output."#
             ChannelRouteSelection {
                 provider: "openrouter".to_string(),
                 model: "route-model".to_string(),
+                reasoning_enabled: None,
+                reasoning_effort: None,
             },
         );
 
@@ -4469,7 +4820,10 @@ BTC is currently around $65,000 based on latest tool output."#
         let reloaded_provider: Arc<dyn Provider> = reloaded_provider_impl.clone();
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-        provider_cache_seed.insert("test-provider".to_string(), reloaded_provider);
+        provider_cache_seed.insert(
+            provider_cache_key("test-provider", None, None),
+            reloaded_provider,
+        );
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -4529,7 +4883,10 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(ModelCaptureProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+        provider_cache_seed.insert(
+            provider_cache_key("test-provider", None, None),
+            Arc::clone(&provider),
+        );
 
         let temp = tempfile::TempDir::new().expect("temp dir");
         let config_path = temp.path().join("config.toml");
@@ -4544,6 +4901,8 @@ BTC is currently around $65,000 based on latest tool output."#
                     defaults: ChannelRuntimeDefaults {
                         default_provider: "test-provider".to_string(),
                         model: "hot-reloaded-model".to_string(),
+                        reasoning_enabled: None,
+                        reasoning_effort: None,
                         temperature: 0.5,
                         api_key: None,
                         api_url: None,
@@ -6340,6 +6699,61 @@ This is an example JSON object for profile settings."#;
     fn maybe_restart_daemon_openrc_args_regression() {
         assert_eq!(OPENRC_STATUS_ARGS, ["zeroclaw", "status"]);
         assert_eq!(OPENRC_RESTART_ARGS, ["zeroclaw", "restart"]);
+    }
+
+    #[test]
+    fn parse_runtime_command_supports_status_channels_models_and_think() {
+        assert_eq!(
+            parse_runtime_command("telegram", "/status"),
+            Some(ChannelRuntimeCommand::ShowStatus)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/channels"),
+            Some(ChannelRuntimeCommand::ShowChannels)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/models"),
+            Some(ChannelRuntimeCommand::ShowModels)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/models gpt-5"),
+            Some(ChannelRuntimeCommand::SetModel("gpt-5".to_string()))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/think off"),
+            Some(ChannelRuntimeCommand::SetThink(Some(false)))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/think high"),
+            Some(ChannelRuntimeCommand::SetThinkEffort("high".to_string()))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/restart"),
+            Some(ChannelRuntimeCommand::RestartService)
+        );
+    }
+
+    #[test]
+    fn normalize_reasoning_effort_respects_model_levels() {
+        assert_eq!(
+            normalize_reasoning_effort_for_model("gpt-5-codex", "minimal"),
+            Some("low".to_string())
+        );
+        assert_eq!(
+            normalize_reasoning_effort_for_model("gpt-5.1-codex-mini", "low"),
+            Some("medium".to_string())
+        );
+        assert_eq!(
+            normalize_reasoning_effort_for_model("gpt-5.3-codex", "xhigh"),
+            Some("xhigh".to_string())
+        );
+    }
+
+    #[test]
+    fn abort_runtime_command_detection_is_channel_scoped() {
+        assert!(is_abort_runtime_command("telegram", "/abort"));
+        assert!(!is_abort_runtime_command("test-channel", "/abort"));
+        assert!(!is_abort_runtime_command("telegram", "abort"));
     }
 
     #[test]
