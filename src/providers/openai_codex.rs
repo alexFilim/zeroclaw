@@ -1493,6 +1493,7 @@ data: [DONE]
             auth_profile_override: None,
             reasoning_enabled: None,
             reasoning_level: None,
+            reasoning_effort: None,
             custom_provider_api_mode: None,
             max_tokens_override: None,
             model_support_vision: None,
