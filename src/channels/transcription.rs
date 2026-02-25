@@ -40,6 +40,7 @@ pub async fn transcribe_audio(
     audio_data: Vec<u8>,
     file_name: &str,
     config: &TranscriptionConfig,
+    configured_api_key: Option<&str>,
 ) -> Result<String> {
     if audio_data.len() > MAX_AUDIO_BYTES {
         bail!(
@@ -59,9 +60,29 @@ pub async fn transcribe_audio(
         )
     })?;
 
-    let api_key = std::env::var("GROQ_API_KEY").context(
-        "GROQ_API_KEY environment variable is not set — required for voice transcription",
-    )?;
+    let api_key = std::env::var("GROQ_API_KEY")
+        .ok()
+        .or_else(|| {
+            configured_api_key
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            std::env::var("ZEROCLAW_API_KEY")
+                .ok()
+                .map(|key| key.trim().to_string())
+                .filter(|key| !key.is_empty())
+        })
+        .or_else(|| {
+            std::env::var("API_KEY")
+                .ok()
+                .map(|key| key.trim().to_string())
+                .filter(|key| !key.is_empty())
+        })
+        .context(
+            "No transcription API key found. Set GROQ_API_KEY, or configure api_key in config.toml",
+        )?;
 
     let client = crate::config::build_runtime_proxy_client("transcription.groq");
 
@@ -114,7 +135,7 @@ mod tests {
         let big = vec![0u8; MAX_AUDIO_BYTES + 1];
         let config = TranscriptionConfig::default();
 
-        let err = transcribe_audio(big, "test.ogg", &config)
+        let err = transcribe_audio(big, "test.ogg", &config, None)
             .await
             .unwrap_err();
         assert!(
@@ -131,11 +152,11 @@ mod tests {
         let data = vec![0u8; 100];
         let config = TranscriptionConfig::default();
 
-        let err = transcribe_audio(data, "test.ogg", &config)
+        let err = transcribe_audio(data, "test.ogg", &config, None)
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("GROQ_API_KEY"),
+            err.to_string().contains("No transcription API key found"),
             "expected missing-key error, got: {err}"
         );
     }
@@ -202,7 +223,7 @@ mod tests {
         let data = vec![0u8; 100];
         let config = TranscriptionConfig::default();
 
-        let err = transcribe_audio(data, "recording.aac", &config)
+        let err = transcribe_audio(data, "recording.aac", &config, None)
             .await
             .unwrap_err();
         let msg = err.to_string();

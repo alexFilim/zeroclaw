@@ -478,6 +478,7 @@ pub struct TelegramChannel {
     /// Override for local Bot API servers or testing.
     api_base: String,
     transcription: Option<crate::config::TranscriptionConfig>,
+    transcription_api_key: Option<String>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
 }
@@ -510,6 +511,7 @@ impl TelegramChannel {
             bot_username: Mutex::new(None),
             api_base: "https://api.telegram.org".to_string(),
             transcription: None,
+            transcription_api_key: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
         }
@@ -551,6 +553,14 @@ impl TelegramChannel {
         if config.enabled {
             self.transcription = Some(config);
         }
+        self
+    }
+
+    /// Configure optional API key fallback for voice transcription.
+    pub fn with_transcription_api_key(mut self, api_key: Option<String>) -> Self {
+        self.transcription_api_key = api_key
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty());
         self
     }
 
@@ -1669,14 +1679,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
-        let text =
-            match super::transcription::transcribe_audio(audio_data, &file_name, config).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!("Voice transcription failed: {e}");
-                    return None;
-                }
-            };
+        let text = match super::transcription::transcribe_audio(
+            audio_data,
+            &file_name,
+            config,
+            self.transcription_api_key.as_deref(),
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Voice transcription failed: {e}");
+                return None;
+            }
+        };
 
         if text.trim().is_empty() {
             tracing::info!("Voice transcription returned empty text, skipping");
@@ -5282,10 +5298,14 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let transcript: String =
-            crate::channels::transcription::transcribe_audio(audio_data, "hello.mp3", &config)
-                .await
-                .expect("transcribe_audio should succeed with valid GROQ_API_KEY");
+        let transcript: String = crate::channels::transcription::transcribe_audio(
+            audio_data,
+            "hello.mp3",
+            &config,
+            None,
+        )
+        .await
+        .expect("transcribe_audio should succeed with valid GROQ_API_KEY");
 
         // 3. Verify Whisper actually recognized "hello"
         assert!(

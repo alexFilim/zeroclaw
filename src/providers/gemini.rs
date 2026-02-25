@@ -1130,6 +1130,9 @@ impl GeminiProvider {
         let usage = result.usage_metadata.map(|u| TokenUsage {
             input_tokens: u.prompt_token_count,
             output_tokens: u.candidates_token_count,
+            token_limit: None,
+            token_remaining: None,
+            rate_limit_summary: None,
         });
 
         let text = result

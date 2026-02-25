@@ -4,7 +4,7 @@ use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
 use crate::providers::{
-    self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
+    self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, TokenUsage, ToolCall,
 };
 use crate::runtime;
 use crate::security::SecurityPolicy;
@@ -426,6 +426,12 @@ pub(crate) fn is_tool_iteration_limit_error(err: &anyhow::Error) -> bool {
     })
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ToolLoopResult {
+    pub text: String,
+    pub usage: Option<TokenUsage>,
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
@@ -461,6 +467,7 @@ pub(crate) async fn agent_turn(
         &[],
     )
     .await
+    .map(|result| result.text)
 }
 
 /// Run the tool loop with channel reply_target context, used by channel runtimes
@@ -595,7 +602,7 @@ pub(crate) async fn run_tool_call_loop(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
-) -> Result<String> {
+) -> Result<ToolLoopResult> {
     let non_cli_approval_context = TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT
         .try_with(Clone::clone)
         .ok()
@@ -609,7 +616,6 @@ pub(crate) async fn run_tool_call_loop(
                 .as_ref()
                 .map(|ctx| ctx.reply_target.clone())
         });
-
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
@@ -638,6 +644,13 @@ pub(crate) async fn run_tool_call_loop(
             serde_json::json!({}),
         );
     }
+    let mut total_input_tokens = 0_u64;
+    let mut total_output_tokens = 0_u64;
+    let mut has_input_usage = false;
+    let mut has_output_usage = false;
+    let mut latest_token_limit: Option<u64> = None;
+    let mut latest_token_remaining: Option<u64> = None;
+    let mut latest_rate_limit_summary: Option<String> = None;
 
     for iteration in 0..max_iterations {
         if cancellation_token
@@ -727,6 +740,26 @@ pub(crate) async fn run_tool_call_loop(
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
             match chat_result {
                 Ok(resp) => {
+                    if let Some(usage) = resp.usage.as_ref() {
+                        if let Some(input_tokens) = usage.input_tokens {
+                            total_input_tokens = total_input_tokens.saturating_add(input_tokens);
+                            has_input_usage = true;
+                        }
+                        if let Some(output_tokens) = usage.output_tokens {
+                            total_output_tokens = total_output_tokens.saturating_add(output_tokens);
+                            has_output_usage = true;
+                        }
+                        if usage.token_limit.is_some() {
+                            latest_token_limit = usage.token_limit;
+                        }
+                        if usage.token_remaining.is_some() {
+                            latest_token_remaining = usage.token_remaining;
+                        }
+                        if usage.rate_limit_summary.is_some() {
+                            latest_rate_limit_summary = usage.rate_limit_summary.clone();
+                        }
+                    }
+
                     let (resp_input_tokens, resp_output_tokens) = resp
                         .usage
                         .as_ref()
@@ -918,7 +951,26 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(display_text);
+            let usage = if has_input_usage
+                || has_output_usage
+                || latest_token_limit.is_some()
+                || latest_token_remaining.is_some()
+                || latest_rate_limit_summary.is_some()
+            {
+                Some(TokenUsage {
+                    input_tokens: has_input_usage.then_some(total_input_tokens),
+                    output_tokens: has_output_usage.then_some(total_output_tokens),
+                    token_limit: latest_token_limit,
+                    token_remaining: latest_token_remaining,
+                    rate_limit_summary: latest_rate_limit_summary.clone(),
+                })
+            } else {
+                None
+            };
+            return Ok(ToolLoopResult {
+                text: display_text,
+                usage,
+            });
         }
 
         // Print any text the LLM produced alongside tool calls (unless silent)
@@ -1763,8 +1815,8 @@ pub async fn run(
             &[],
         )
         .await?;
-        final_output = response.clone();
-        println!("{response}");
+        final_output = response.text.clone();
+        println!("{}", response.text);
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
@@ -1900,10 +1952,13 @@ pub async fn run(
                     continue;
                 }
             };
-            final_output = response.clone();
+            final_output = response.text.clone();
             if let Err(e) = crate::channels::Channel::send(
                 &cli,
-                &crate::channels::traits::SendMessage::new(format!("\n{response}\n"), "user"),
+                &crate::channels::traits::SendMessage::new(
+                    format!("\n{}\n", response.text),
+                    "user",
+                ),
             )
             .await
             {
@@ -2596,7 +2651,7 @@ mod tests {
         .await
         .expect("valid multimodal payload should pass");
 
-        assert_eq!(result, "vision-ok");
+        assert_eq!(result.text, "vision-ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -2722,7 +2777,7 @@ mod tests {
         .await
         .expect("parallel execution should complete");
 
-        assert_eq!(result, "done");
+        assert_eq!(result.text, "done");
         assert!(
             max_active.load(Ordering::SeqCst) >= 1,
             "tools should execute successfully"
@@ -3051,7 +3106,7 @@ mod tests {
         .await
         .expect("loop should finish after deduplicating repeated calls");
 
-        assert_eq!(result, "done");
+        assert_eq!(result.text, "done");
         assert_eq!(
             invocations.load(Ordering::SeqCst),
             1,
@@ -3107,7 +3162,7 @@ mod tests {
         .await
         .expect("native fallback id flow should complete");
 
-        assert_eq!(result, "done");
+        assert_eq!(result.text, "done");
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
         assert!(
             history.iter().any(|msg| {

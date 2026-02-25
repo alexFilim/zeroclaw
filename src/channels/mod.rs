@@ -73,6 +73,7 @@ use crate::agent::loop_::{
 };
 use crate::approval::{ApprovalManager, ApprovalResponse, PendingApprovalError};
 use crate::config::{Config, NonCliNaturalLanguageApprovalMode};
+use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, runtime_trace, Observer};
@@ -258,6 +259,9 @@ struct ChannelUsageSnapshot {
     est_last_response_tokens: u64,
     est_total_input_tokens: u64,
     est_total_output_tokens: u64,
+    provider_token_limit: Option<u64>,
+    provider_token_remaining: Option<u64>,
+    provider_rate_limit_summary: Option<String>,
     turns_completed: u64,
     updated_at: SystemTime,
 }
@@ -265,6 +269,12 @@ struct ChannelUsageSnapshot {
 fn usage_store() -> &'static Mutex<HashMap<String, ChannelUsageSnapshot>> {
     static STORE: OnceLock<Mutex<HashMap<String, ChannelUsageSnapshot>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn pending_limit_store() -> &'static tokio::sync::Mutex<HashMap<String, PendingLimitContinuation>> {
+    static STORE: OnceLock<tokio::sync::Mutex<HashMap<String, PendingLimitContinuation>>> =
+        OnceLock::new();
+    STORE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
 const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "zeroclaw.service"];
@@ -309,6 +319,12 @@ struct InFlightSenderTaskState {
     task_id: u64,
     cancellation: CancellationToken,
     completion: Arc<InFlightTaskCompletion>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingLimitContinuation {
+    prepared_content: String,
+    prompt_summary: String,
 }
 
 struct InFlightTaskCompletion {
@@ -356,6 +372,33 @@ fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
 
 fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
+}
+
+fn normalize_slash_command_token(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+
+    Some(
+        trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .split('@')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+    )
+}
+
+fn is_pending_limit_continue_command(content: &str) -> bool {
+    normalize_slash_command_token(content).is_some_and(|command| command == "/continue")
+}
+
+fn is_pending_limit_cancel_command(content: &str) -> bool {
+    normalize_slash_command_token(content)
+        .is_some_and(|command| command == "/cancel-limit" || command == "/cancel")
 }
 
 /// Strip tool-call XML tags from outgoing messages.
@@ -1833,6 +1876,158 @@ fn domain_approval_prompt_from_error(err: &anyhow::Error) -> Option<String> {
     ))
 }
 
+fn format_mib(bytes: usize) -> String {
+    format!("{:.2}", bytes as f64 / (1024.0 * 1024.0))
+}
+
+fn compose_content_with_image_refs(cleaned_text: &str, refs: &[String]) -> String {
+    let trimmed = cleaned_text.trim();
+    if refs.is_empty() {
+        return trimmed.to_string();
+    }
+
+    if trimmed.is_empty() {
+        return refs
+            .iter()
+            .map(|reference| format!("[IMAGE:{reference}]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    format!(
+        "{trimmed}\n\n{}",
+        refs.iter()
+            .map(|reference| format!("[IMAGE:{reference}]"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+fn strip_image_markers_from_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> usize {
+    let mut histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(turns) = histories.get_mut(sender_key) else {
+        return 0;
+    };
+
+    let mut removed = 0usize;
+    for turn in turns.iter_mut() {
+        if turn.role != "user" {
+            continue;
+        }
+
+        let (cleaned_text, refs) = crate::multimodal::parse_image_markers(&turn.content);
+        if refs.is_empty() {
+            continue;
+        }
+
+        removed += refs.len();
+        turn.content = if cleaned_text.is_empty() {
+            "[Image attachments omitted after continuation approval]".to_string()
+        } else {
+            cleaned_text
+        };
+    }
+
+    removed
+}
+
+fn multimodal_limit_prompt_from_error(
+    err: &anyhow::Error,
+    original_content: &str,
+) -> Option<(String, PendingLimitContinuation)> {
+    use crate::multimodal::MultimodalError;
+
+    let multimodal_error = err.downcast_ref::<MultimodalError>()?;
+    let (cleaned_text, refs) = crate::multimodal::parse_image_markers(original_content);
+
+    match multimodal_error {
+        MultimodalError::TooManyImages { max_images, found } => {
+            let kept_refs = refs
+                .iter()
+                .take(*max_images)
+                .cloned()
+                .collect::<Vec<String>>();
+            let dropped_from_latest = refs.len().saturating_sub(kept_refs.len());
+
+            let mut prepared_content = compose_content_with_image_refs(&cleaned_text, &kept_refs);
+            if prepared_content.trim().is_empty() {
+                prepared_content =
+                    "Continue with the previous request using available context.".to_string();
+            }
+
+            let drop_note = if dropped_from_latest > 0 {
+                format!(
+                    "\n- dropping {} image(s) from your latest message",
+                    dropped_from_latest
+                )
+            } else {
+                String::new()
+            };
+
+            let prompt = format!(
+                "⚠️ Multimodal image limit reached.\nLimit: max_images={max_images}, found={found} image marker(s) in this request context.\nReply `/continue` to proceed safely by:\n- removing image markers from earlier turns in this chat{drop_note}\nReply `/cancel-limit` to cancel this request."
+            );
+
+            Some((
+                prompt,
+                PendingLimitContinuation {
+                    prepared_content,
+                    prompt_summary: format!(
+                        "kept {} image(s) from your latest message (dropped {}).",
+                        kept_refs.len(),
+                        dropped_from_latest
+                    ),
+                },
+            ))
+        }
+        MultimodalError::ImageTooLarge {
+            input,
+            size_bytes,
+            max_bytes,
+        } => {
+            let kept_refs = refs
+                .iter()
+                .filter(|reference| reference.as_str() != input.as_str())
+                .cloned()
+                .collect::<Vec<String>>();
+            let dropped_from_latest = refs.len().saturating_sub(kept_refs.len());
+
+            let mut prepared_content = compose_content_with_image_refs(&cleaned_text, &kept_refs);
+            if prepared_content.trim().is_empty() {
+                prepared_content =
+                    "Continue with the previous request using available context.".to_string();
+            }
+
+            let drop_note = if dropped_from_latest > 0 {
+                "\n- dropping the oversized image from your latest message"
+            } else {
+                "\n- removing image markers from earlier turns in this chat"
+            };
+
+            let prompt = format!(
+                "⚠️ Multimodal image size limit reached.\nImage: `{input}`\nSize: {} MiB (limit: {} MiB).\nReply `/continue` to proceed safely by:{drop_note}\nReply `/cancel-limit` to cancel this request.",
+                format_mib(*size_bytes),
+                format_mib(*max_bytes),
+            );
+
+            Some((
+                prompt,
+                PendingLimitContinuation {
+                    prepared_content,
+                    prompt_summary: format!(
+                        "removed oversized image marker(s) from latest message: {}.",
+                        dropped_from_latest
+                    ),
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<String> {
     let cache_path = workspace_dir.join("state").join(MODEL_CACHE_FILE);
     let Ok(raw) = std::fs::read_to_string(cache_path) else {
@@ -2068,11 +2263,8 @@ fn estimate_tokens_from_chars(chars: usize) -> u64 {
 }
 
 fn build_usage_response(sender_key: &str, current: &ChannelRouteSelection) -> String {
-    let maybe_usage = usage_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(sender_key)
-        .cloned();
+    let usage_map = usage_store().lock().unwrap_or_else(|e| e.into_inner());
+    let maybe_usage = usage_map.get(sender_key).cloned();
 
     let thinking = match current.reasoning_enabled {
         Some(true) => "on",
@@ -2082,6 +2274,28 @@ fn build_usage_response(sender_key: &str, current: &ChannelRouteSelection) -> St
     let effort = current.reasoning_effort.as_deref().unwrap_or("auto");
 
     let Some(usage) = maybe_usage else {
+        let latest_provider_snapshot = usage_map
+            .values()
+            .filter(|entry| entry.provider == current.provider && entry.model == current.model)
+            .max_by_key(|entry| {
+                entry
+                    .updated_at
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs())
+            })
+            .cloned();
+        if let Some(provider_usage) = latest_provider_snapshot {
+            return format!(
+                "Usage snapshot for this session:\nProvider: `{}`\nModel: `{}`\nReasoning: `{}` (effort: `{}`)\nNo usage recorded yet for this sender.\nLatest provider snapshot in runtime:\nProvider token bucket: limit={} remaining={}\nProvider rate-limit details: {}",
+                current.provider,
+                current.model,
+                thinking,
+                effort,
+                provider_usage.provider_token_limit.map_or_else(|| "n/a".to_string(), |v| v.to_string()),
+                provider_usage.provider_token_remaining.map_or_else(|| "n/a".to_string(), |v| v.to_string()),
+                provider_usage.provider_rate_limit_summary.as_deref().unwrap_or("n/a"),
+            );
+        }
         return format!(
             "Usage snapshot for this session:\nProvider: `{}`\nModel: `{}`\nReasoning: `{}` (effort: `{}`)\nNo usage recorded yet for this sender.",
             current.provider, current.model, thinking, effort
@@ -2094,7 +2308,7 @@ fn build_usage_response(sender_key: &str, current: &ChannelRouteSelection) -> St
         .map_or(0, |d| d.as_secs());
 
     format!(
-        "Usage snapshot for this session:\nProvider: `{}`\nModel: `{}`\nReasoning: `{}` (effort: `{}`)\nTurns completed: {}\nHistory messages: {}\nContext size: {} chars (~{} tokens)\nLast response: {} chars (~{} tokens)\nEstimated token totals: input={} output={} total={}\nUpdated at (unix): {}",
+        "Usage snapshot for this session:\nProvider: `{}`\nModel: `{}`\nReasoning: `{}` (effort: `{}`)\nTurns completed: {}\nHistory messages: {}\nContext size: {} chars (~{} tokens)\nLast response: {} chars (~{} tokens)\nEstimated token totals: input={} output={} total={}\nProvider token bucket: limit={} remaining={}\nProvider rate-limit details: {}\nUpdated at (unix): {}",
         usage.provider,
         usage.model,
         match usage.reasoning_enabled {
@@ -2112,6 +2326,9 @@ fn build_usage_response(sender_key: &str, current: &ChannelRouteSelection) -> St
         usage.est_total_input_tokens,
         usage.est_total_output_tokens,
         usage.est_total_input_tokens.saturating_add(usage.est_total_output_tokens),
+        usage.provider_token_limit.map_or_else(|| "n/a".to_string(), |v| v.to_string()),
+        usage.provider_token_remaining.map_or_else(|| "n/a".to_string(), |v| v.to_string()),
+        usage.provider_rate_limit_summary.as_deref().unwrap_or("n/a"),
         updated_epoch
     )
 }
@@ -2220,6 +2437,231 @@ fn build_domain_policy_update_response(raw_domain: &str, kind: DomainListKind) -
         },
         Err(err) => format!("Failed to update domain policy for `{domain}`: {err}"),
     }
+}
+
+fn quota_key_for_usage(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("weekly")
+        || key.contains("5h")
+        || key.contains("five")
+        || key.contains("hour")
+        || key.contains("remaining")
+        || key.contains("limit")
+        || key.contains("quota")
+        || key.contains("percent")
+        || key.contains("reset")
+}
+
+fn summarize_codex_usage_window_for_usage(
+    label: &str,
+    window: &serde_json::Value,
+) -> Option<String> {
+    let used_percent = window
+        .get("used_percent")
+        .and_then(serde_json::Value::as_u64)?;
+    let remaining_percent = 100_u64.saturating_sub(used_percent.min(100));
+    let reset_after = window
+        .get("reset_after_seconds")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_default();
+    let reset_at = window
+        .get("reset_at")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_default();
+    let reset_after_human = humanize_reset_after_seconds(reset_after);
+    let reset_at_human = humanize_unix_timestamp_utc(reset_at);
+    Some(format!(
+        "{label} remaining={remaining_percent}% (used={used_percent}%, reset in {reset_after_human}, reset at {reset_at_human})"
+    ))
+}
+
+fn humanize_reset_after_seconds(seconds: i64) -> String {
+    if seconds <= 0 {
+        return "now".to_string();
+    }
+    let mut remaining = seconds;
+    let days = remaining / 86_400;
+    remaining %= 86_400;
+    let hours = remaining / 3_600;
+    remaining %= 3_600;
+    let minutes = remaining / 60;
+    let secs = remaining % 60;
+
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{days}d"));
+    }
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if minutes > 0 {
+        parts.push(format!("{minutes}m"));
+    }
+    if secs > 0 && parts.is_empty() {
+        parts.push(format!("{secs}s"));
+    }
+    if parts.is_empty() {
+        "now".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn humanize_unix_timestamp_utc(timestamp: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| timestamp.to_string())
+}
+
+fn summarize_codex_usage_payload_for_usage(value: &serde_json::Value) -> Option<String> {
+    let rate_limit = value.get("rate_limit")?;
+    let mut parts = Vec::new();
+    if let Some(window) = rate_limit.get("primary_window") {
+        if let Some(summary) = summarize_codex_usage_window_for_usage("5h", window) {
+            parts.push(summary);
+        }
+    }
+    if let Some(window) = rate_limit.get("secondary_window") {
+        if let Some(summary) = summarize_codex_usage_window_for_usage("weekly", window) {
+            parts.push(summary);
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
+}
+
+fn collect_quota_pairs_for_usage(value: &serde_json::Value, path: &str, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let child_path = if path.is_empty() {
+                    k.to_string()
+                } else {
+                    format!("{path}.{k}")
+                };
+                if quota_key_for_usage(k) || quota_key_for_usage(&child_path) {
+                    match v {
+                        serde_json::Value::String(s) if !s.trim().is_empty() => {
+                            out.push(format!("{child_path}={}", s.trim()));
+                        }
+                        serde_json::Value::Number(n) => out.push(format!("{child_path}={n}")),
+                        serde_json::Value::Bool(b) => out.push(format!("{child_path}={b}")),
+                        _ => {}
+                    }
+                }
+                collect_quota_pairs_for_usage(v, &child_path, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for (idx, item) in arr.iter().enumerate() {
+                let child_path = if path.is_empty() {
+                    format!("[{idx}]")
+                } else {
+                    format!("{path}[{idx}]")
+                };
+                collect_quota_pairs_for_usage(item, &child_path, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn summarize_quota_payload_for_usage(value: &serde_json::Value) -> Option<String> {
+    if let Some(summary) = summarize_codex_usage_payload_for_usage(value) {
+        return Some(summary);
+    }
+
+    let mut pairs = Vec::new();
+    collect_quota_pairs_for_usage(value, "", &mut pairs);
+    if pairs.is_empty() {
+        None
+    } else {
+        pairs.sort();
+        pairs.dedup();
+        Some(pairs.join("; "))
+    }
+}
+
+async fn fetch_openai_codex_quota_summary_for_usage(ctx: &ChannelRuntimeContext) -> Option<String> {
+    let state_dir = ctx
+        .provider_runtime_options
+        .zeroclaw_dir
+        .clone()
+        .unwrap_or_else(|| {
+            directories::UserDirs::new().map_or_else(
+                || std::path::PathBuf::from(".zeroclaw"),
+                |dirs| dirs.home_dir().join(".zeroclaw"),
+            )
+        });
+    let auth =
+        crate::auth::AuthService::new(&state_dir, ctx.provider_runtime_options.secrets_encrypt);
+    let profile = auth
+        .get_profile(
+            "openai-codex",
+            ctx.provider_runtime_options
+                .auth_profile_override
+                .as_deref(),
+        )
+        .await
+        .ok()
+        .flatten();
+    let access_token = auth
+        .get_valid_openai_access_token(
+            ctx.provider_runtime_options
+                .auth_profile_override
+                .as_deref(),
+        )
+        .await
+        .ok()
+        .flatten()?;
+    let account_id = profile
+        .and_then(|profile| profile.account_id)
+        .or_else(|| extract_account_id_from_jwt(&access_token))?;
+
+    const ENDPOINTS: [&str; 5] = [
+        "https://chatgpt.com/backend-api/codex/usage",
+        "https://chatgpt.com/backend-api/codex/rate_limits",
+        "https://chatgpt.com/backend-api/codex/limits",
+        "https://chatgpt.com/backend-api/usage_limits",
+        "https://chatgpt.com/backend-api/limits",
+    ];
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+    for endpoint in ENDPOINTS {
+        let response = match client
+            .get(endpoint)
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("chatgpt-account-id", account_id.clone())
+            .header("originator", "pi")
+            .header("accept", "application/json")
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(_) => continue,
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(_) => continue,
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        if let Some(summary) = summarize_quota_payload_for_usage(&json) {
+            return Some(summary);
+        }
+    }
+    None
 }
 
 async fn handle_runtime_command_if_needed(
@@ -2351,7 +2793,15 @@ async fn handle_runtime_command_if_needed(
     let response = match command {
         ChannelRuntimeCommand::ShowStatus => build_status_response(ctx, &current),
         ChannelRuntimeCommand::ShowChannels => build_channels_help_response(ctx),
-        ChannelRuntimeCommand::ShowUsage => build_usage_response(&sender_key, &current),
+        ChannelRuntimeCommand::ShowUsage => {
+            let mut response = build_usage_response(&sender_key, &current);
+            if current.provider == "openai-codex" {
+                if let Some(summary) = fetch_openai_codex_quota_summary_for_usage(ctx).await {
+                    let _ = write!(response, "\nAccount quota details: {summary}");
+                }
+            }
+            response
+        }
         ChannelRuntimeCommand::ShowSessions => build_sessions_response(ctx, &msg.channel),
         ChannelRuntimeCommand::CompactConversation => {
             let compacted = compact_sender_history(ctx, &sender_key);
@@ -3487,7 +3937,7 @@ async fn process_channel_message(
     );
 
     // ── Hook: on_message_received (modifying) ────────────
-    let msg = if let Some(hooks) = &ctx.hooks {
+    let mut msg = if let Some(hooks) = &ctx.hooks {
         match hooks.run_on_message_received(msg).await {
             crate::hooks::HookResult::Cancel(reason) => {
                 tracing::info!(%reason, "incoming message dropped by hook");
@@ -3550,6 +4000,70 @@ or tune thresholds in config.",
             }
             return;
         }
+    }
+
+    let pending_scope_key = interruption_scope_key(&msg);
+    if is_pending_limit_cancel_command(&msg.content) {
+        let cancelled = pending_limit_store()
+            .lock()
+            .await
+            .remove(&pending_scope_key)
+            .is_some();
+        if let Some(channel) = target_channel.as_ref() {
+            let response = if cancelled {
+                "Cancelled the pending continuation request.".to_string()
+            } else {
+                "No pending continuation request to cancel.".to_string()
+            };
+            let _ = channel
+                .send(
+                    &SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()),
+                )
+                .await;
+        }
+        return;
+    }
+
+    if is_pending_limit_continue_command(&msg.content) {
+        let Some(pending) = pending_limit_store()
+            .lock()
+            .await
+            .remove(&pending_scope_key)
+        else {
+            if let Some(channel) = target_channel.as_ref() {
+                let _ = channel
+                    .send(
+                        &SendMessage::new(
+                            "No pending continuation request. Send a normal message first.",
+                            &msg.reply_target,
+                        )
+                        .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await;
+            }
+            return;
+        };
+
+        let history_key = conversation_history_key(&msg);
+        let removed_from_history =
+            strip_image_markers_from_sender_history(ctx.as_ref(), &history_key);
+
+        if let Some(channel) = target_channel.as_ref() {
+            let _ = channel
+                .send(
+                    &SendMessage::new(
+                        format!(
+                            "↪️ Continuing previous request.\n- {}\n- removed {} image marker(s) from earlier turns.",
+                            pending.prompt_summary, removed_from_history
+                        ),
+                        &msg.reply_target,
+                    )
+                    .in_thread(msg.thread_ts.clone()),
+                )
+                .await;
+        }
+
+        msg.content = pending.prepared_content;
     }
 
     let history_key = conversation_history_key(&msg);
@@ -3758,7 +4272,12 @@ or tune thresholds in config.",
     let history_len_before_tools = history.len();
 
     enum LlmExecutionResult {
-        Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
+        Completed(
+            Result<
+                Result<crate::agent::loop_::ToolLoopResult, anyhow::Error>,
+                tokio::time::error::Elapsed,
+            >,
+        ),
         Cancelled,
     }
 
@@ -3880,7 +4399,8 @@ or tune thresholds in config.",
                 }
             }
         }
-        LlmExecutionResult::Completed(Ok(Ok(response))) => {
+        LlmExecutionResult::Completed(Ok(Ok(loop_result))) => {
+            let response = loop_result.text;
             let context_chars: usize = history.iter().map(|m| m.content.chars().count()).sum();
             let last_response_chars = response.chars().count();
             let est_context_tokens = estimate_tokens_from_chars(context_chars);
@@ -3902,6 +4422,9 @@ or tune thresholds in config.",
                             est_last_response_tokens,
                             est_total_input_tokens: 0,
                             est_total_output_tokens: 0,
+                            provider_token_limit: None,
+                            provider_token_remaining: None,
+                            provider_rate_limit_summary: None,
                             turns_completed: 0,
                             updated_at: SystemTime::now(),
                         });
@@ -3921,6 +4444,18 @@ or tune thresholds in config.",
                 usage_entry.est_total_output_tokens = usage_entry
                     .est_total_output_tokens
                     .saturating_add(est_last_response_tokens);
+                if let Some(provider_usage) = loop_result.usage.as_ref() {
+                    if provider_usage.token_limit.is_some() {
+                        usage_entry.provider_token_limit = provider_usage.token_limit;
+                    }
+                    if provider_usage.token_remaining.is_some() {
+                        usage_entry.provider_token_remaining = provider_usage.token_remaining;
+                    }
+                    if provider_usage.rate_limit_summary.is_some() {
+                        usage_entry.provider_rate_limit_summary =
+                            provider_usage.rate_limit_summary.clone();
+                    }
+                }
                 usage_entry.turns_completed = usage_entry.turns_completed.saturating_add(1);
                 usage_entry.updated_at = SystemTime::now();
             }
@@ -4108,6 +4643,52 @@ or tune thresholds in config.",
                         let _ = channel
                             .send(
                                 &SendMessage::new(approval_prompt, &msg.reply_target)
+                                    .in_thread(msg.thread_ts.clone()),
+                            )
+                            .await;
+                    }
+                }
+            } else if let Some((limit_prompt, pending)) =
+                multimodal_limit_prompt_from_error(&e, &msg.content)
+            {
+                runtime_trace::record_event(
+                    "channel_limit_confirmation_required",
+                    Some(msg.channel.as_str()),
+                    Some(route.provider.as_str()),
+                    Some(route.model.as_str()),
+                    None,
+                    Some(false),
+                    Some("multimodal limit confirmation required"),
+                    serde_json::json!({
+                        "sender": msg.sender,
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                        "error": providers::sanitize_api_error(&e.to_string()),
+                    }),
+                );
+                pending_limit_store()
+                    .lock()
+                    .await
+                    .insert(interruption_scope_key(&msg), pending);
+
+                let rolled_back =
+                    rollback_orphan_user_turn(ctx.as_ref(), &history_key, &msg.content);
+                if !rolled_back {
+                    append_sender_turn(
+                        ctx.as_ref(),
+                        &history_key,
+                        ChatMessage::assistant("[Limit reached — awaiting `/continue`]"),
+                    );
+                }
+
+                if let Some(channel) = target_channel.as_ref() {
+                    if let Some(ref draft_id) = draft_message_id {
+                        let _ = channel
+                            .finalize_draft(&msg.reply_target, draft_id, &limit_prompt)
+                            .await;
+                    } else {
+                        let _ = channel
+                            .send(
+                                &SendMessage::new(limit_prompt, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
                             .await;
@@ -4902,7 +5483,7 @@ fn collect_configured_channels(
 
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
-            channel: Arc::new(telegram),
+            channel: Arc::new(telegram.with_transcription_api_key(config.api_key.clone())),
         });
     }
 
@@ -5702,6 +6283,7 @@ mod tests {
     use super::*;
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
+    use crate::providers::traits::ProviderCapabilities;
     use crate::providers::{ChatMessage, Provider};
     use crate::tools::{Tool, ToolResult};
     use std::collections::{HashMap, HashSet};
@@ -6548,6 +7130,46 @@ BTC is currently around $65,000 based on latest tool output."#
             };
             tokio::time::sleep(self.delay).await;
             Ok(format!("response-{call_index}"))
+        }
+    }
+
+    #[derive(Default)]
+    struct VisionCaptureProvider {
+        calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for VisionCaptureProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                vision: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("fallback".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let snapshot = messages
+                .iter()
+                .map(|message| (message.role.clone(), message.content.clone()))
+                .collect::<Vec<_>>();
+            let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+            calls.push(snapshot);
+            Ok("vision-ok".to_string())
         }
     }
 
@@ -8651,6 +9273,176 @@ BTC is currently around $65,000 based on latest tool output."#
                 .unwrap_or_else(|e| e.into_inner())
                 .as_slice(),
             &["route-model".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_usage_command_message_includes_remaining_limits_details() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let sender = format!("usage_user_{}", uuid::Uuid::new_v4());
+        let reply_target = "chat-usage";
+        let sender_key = format!("telegram_{sender}");
+        let provider_name = format!("openai-codex-{}", uuid::Uuid::new_v4());
+        let model_name = "gpt-5.3-codex".to_string();
+
+        usage_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                sender_key.clone(),
+                ChannelUsageSnapshot {
+                    provider: provider_name.clone(),
+                    model: model_name.clone(),
+                    reasoning_enabled: None,
+                    reasoning_effort: Some("auto".to_string()),
+                    history_messages: 5,
+                    context_chars: 500,
+                    est_context_tokens: 125,
+                    last_response_chars: 120,
+                    est_last_response_tokens: 30,
+                    est_total_input_tokens: 1000,
+                    est_total_output_tokens: 200,
+                    provider_token_limit: Some(100_000),
+                    provider_token_remaining: Some(83_000),
+                    provider_rate_limit_summary: Some("weekly=5%; five_hour=75%".to_string()),
+                    turns_completed: 2,
+                    updated_at: SystemTime::now(),
+                },
+            );
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new(provider_name.clone()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new(model_name.clone()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-usage-1".to_string(),
+                sender,
+                reply_target: reply_target.to_string(),
+                content: "/usage".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        let payload = &sent_messages[0];
+        assert!(
+            payload.starts_with(&format!("{reply_target}:Usage snapshot for this session:")),
+            "expected usage response message, got: {payload}"
+        );
+        assert!(
+            payload.contains("Provider token bucket: limit=100000 remaining=83000"),
+            "expected remaining token limit details in message, got: {payload}"
+        );
+        assert!(
+            payload.contains("Provider rate-limit details: weekly=5%; five_hour=75%"),
+            "expected provider rate-limit details in message, got: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Live /usage probe against OpenAI Codex account quota API"]
+    async fn telegram_usage_command_live_includes_account_quota_details() {
+        if std::env::var("ZEROCLAW_LIVE_QUOTA_PROBE").ok().as_deref() != Some("1") {
+            eprintln!("Skipping live /usage probe. Set ZEROCLAW_LIVE_QUOTA_PROBE=1 to run.");
+            return;
+        }
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let sender = format!("usage_live_user_{}", uuid::Uuid::new_v4());
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("openai-codex".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("gpt-5.3-codex".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-usage-live-1".to_string(),
+                sender,
+                reply_target: "chat-usage-live".to_string(),
+                content: "/usage".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        let payload = &sent_messages[0];
+        assert!(
+            payload.contains("Account quota details: 5h remaining="),
+            "expected 5h quota details in live /usage output, got: {payload}"
+        );
+        assert!(
+            payload.contains("weekly remaining="),
+            "expected weekly quota details in live /usage output, got: {payload}"
         );
     }
 
@@ -10926,6 +11718,141 @@ BTC is currently around $65,000 based on latest tool output."#;
     }
 
     #[test]
+    fn summarize_quota_payload_for_usage_prefers_codex_usage_windows() {
+        let payload = serde_json::json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 17,
+                    "reset_after_seconds": 1200,
+                    "reset_at": 1773000000
+                },
+                "secondary_window": {
+                    "used_percent": 95,
+                    "reset_after_seconds": 86000,
+                    "reset_at": 1773600000
+                }
+            }
+        });
+
+        let summary = summarize_quota_payload_for_usage(&payload).expect("summary");
+        assert!(summary.contains("5h remaining=83% (used=17%"));
+        assert!(summary.contains("weekly remaining=5% (used=95%"));
+    }
+
+    #[test]
+    fn telegram_usage_command_includes_remaining_limits_for_sender_snapshot() {
+        let sender_key = format!("telegram_{}", uuid::Uuid::new_v4());
+        let provider = format!("openai-codex-{}", uuid::Uuid::new_v4());
+        let model = "gpt-5.3-codex-test".to_string();
+
+        usage_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                sender_key.clone(),
+                ChannelUsageSnapshot {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    reasoning_enabled: None,
+                    reasoning_effort: Some("auto".to_string()),
+                    history_messages: 3,
+                    context_chars: 120,
+                    est_context_tokens: 30,
+                    last_response_chars: 40,
+                    est_last_response_tokens: 10,
+                    est_total_input_tokens: 300,
+                    est_total_output_tokens: 90,
+                    provider_token_limit: Some(100_000),
+                    provider_token_remaining: Some(83_000),
+                    provider_rate_limit_summary: Some("weekly=8%; five_hour=83%".to_string()),
+                    turns_completed: 2,
+                    updated_at: SystemTime::now(),
+                },
+            );
+
+        assert_eq!(
+            parse_runtime_command("telegram", "/usage"),
+            Some(ChannelRuntimeCommand::ShowUsage)
+        );
+
+        let current = ChannelRouteSelection {
+            provider,
+            model,
+            reasoning_enabled: None,
+            reasoning_effort: Some("auto".to_string()),
+        };
+        let response = build_usage_response(&sender_key, &current);
+
+        assert!(
+            response.contains("Provider token bucket: limit=100000 remaining=83000"),
+            "expected remaining token bucket data in /usage output, got: {response}"
+        );
+        assert!(
+            response.contains("Provider rate-limit details: weekly=8%; five_hour=83%"),
+            "expected provider rate-limit details in /usage output, got: {response}"
+        );
+    }
+
+    #[test]
+    fn telegram_usage_command_fallback_includes_remaining_limits_from_latest_provider_snapshot() {
+        let sender_key = format!("telegram_missing_{}", uuid::Uuid::new_v4());
+        let provider = format!("openai-codex-{}", uuid::Uuid::new_v4());
+        let model = "gpt-5.3-codex-fallback-test".to_string();
+        let seeded_sender_key = format!("telegram_seeded_{}", uuid::Uuid::new_v4());
+
+        usage_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                seeded_sender_key,
+                ChannelUsageSnapshot {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    reasoning_enabled: None,
+                    reasoning_effort: Some("auto".to_string()),
+                    history_messages: 5,
+                    context_chars: 200,
+                    est_context_tokens: 50,
+                    last_response_chars: 80,
+                    est_last_response_tokens: 20,
+                    est_total_input_tokens: 500,
+                    est_total_output_tokens: 140,
+                    provider_token_limit: Some(120_000),
+                    provider_token_remaining: Some(96_000),
+                    provider_rate_limit_summary: Some("weekly=8%; five_hour=83%".to_string()),
+                    turns_completed: 4,
+                    updated_at: SystemTime::now(),
+                },
+            );
+
+        assert_eq!(
+            parse_runtime_command("telegram", "/usage"),
+            Some(ChannelRuntimeCommand::ShowUsage)
+        );
+
+        let current = ChannelRouteSelection {
+            provider,
+            model,
+            reasoning_enabled: None,
+            reasoning_effort: Some("auto".to_string()),
+        };
+        let response = build_usage_response(&sender_key, &current);
+
+        assert!(
+            response.contains("No usage recorded yet for this sender."),
+            "expected sender-missing notice in /usage output, got: {response}"
+        );
+        assert!(
+            response.contains("Latest provider snapshot in runtime:"),
+            "expected provider-level fallback in /usage output, got: {response}"
+        );
+        assert!(
+            response.contains("Provider token bucket: limit=120000 remaining=96000"),
+            "expected remaining limits in provider fallback /usage output, got: {response}"
+        );
+    }
+
+    #[test]
     fn normalize_reasoning_effort_respects_model_levels() {
         assert_eq!(
             normalize_reasoning_effort_for_model("gpt-5-codex", "minimal"),
@@ -11168,6 +12095,147 @@ BTC is currently around $65,000 based on latest tool output."#;
         assert!(
             turns.iter().all(|turn| !turn.content.contains("[IMAGE:")),
             "failed vision turn must not persist image marker content"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_multimodal_limit_can_continue_with_confirmation() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(VisionCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig {
+                max_images: 1,
+                ..crate::config::MultimodalConfig::default()
+            },
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        let sender = "zeroclaw_limit_user";
+        let reply_target = "chat-limit";
+        let first = traits::ChannelMessage {
+            id: "msg-limit-1".to_string(),
+            sender: sender.to_string(),
+            reply_target: reply_target.to_string(),
+            content: "Compare these.\n\n[IMAGE:data:image/png;base64,AA==]\n[IMAGE:data:image/png;base64,AQ==]"
+                .to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+        };
+
+        process_channel_message(
+            Arc::clone(&runtime_ctx),
+            first.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let pending_key = interruption_scope_key(&first);
+        assert!(
+            pending_limit_store()
+                .lock()
+                .await
+                .contains_key(&pending_key),
+            "pending continuation should be stored"
+        );
+
+        {
+            let sent = channel_impl.sent_messages.lock().await;
+            assert_eq!(sent.len(), 1);
+            assert!(sent[0].contains("Multimodal image limit reached"));
+            assert!(sent[0].contains("/continue"));
+        }
+
+        let history_key = conversation_history_key(&first);
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !histories.contains_key(&history_key),
+            "failed turn should be rolled back from conversation history"
+        );
+        drop(histories);
+
+        let continue_msg = traits::ChannelMessage {
+            id: "msg-limit-2".to_string(),
+            sender: sender.to_string(),
+            reply_target: reply_target.to_string(),
+            content: "/continue".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 2,
+            thread_ts: None,
+        };
+
+        process_channel_message(
+            Arc::clone(&runtime_ctx),
+            continue_msg,
+            CancellationToken::new(),
+        )
+        .await;
+
+        {
+            let sent = channel_impl.sent_messages.lock().await;
+            assert_eq!(sent.len(), 3, "prompt + continuation note + final reply");
+            assert!(sent[1].contains("Continuing previous request"));
+            assert!(sent[2].contains("vision-ok"));
+        }
+
+        assert!(
+            !pending_limit_store()
+                .lock()
+                .await
+                .contains_key(&pending_key),
+            "pending continuation should be consumed on /continue"
+        );
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            calls.len(),
+            1,
+            "provider should be called only after /continue"
+        );
+        let last_user = calls[0]
+            .iter()
+            .rev()
+            .find_map(|(role, content)| (role == "user").then_some(content.as_str()))
+            .expect("user message should be present in provider call");
+        assert_eq!(
+            crate::multimodal::parse_image_markers(last_user).1.len(),
+            1,
+            "continued request must cap latest message to one image"
         );
     }
 }

@@ -33,12 +33,13 @@ pub mod traits;
 #[allow(unused_imports)]
 pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ProviderCapabilityError,
-    ToolCall, ToolResultMessage,
+    TokenUsage, ToolCall, ToolResultMessage,
 };
 
 use crate::auth::AuthService;
 use compatible::{AuthStyle, CompatibleApiMode, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
+use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -75,6 +76,24 @@ const QWEN_OAUTH_CREDENTIAL_FILE: &str = ".qwen/oauth_creds.json";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 const VERCEL_AI_GATEWAY_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
+
+fn parse_u64_header(headers: &HeaderMap, name: &str) -> Option<u64> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
+pub(crate) fn token_rate_limit_from_headers(headers: &HeaderMap) -> (Option<u64>, Option<u64>) {
+    let limit = parse_u64_header(headers, "x-ratelimit-limit-tokens")
+        .or_else(|| parse_u64_header(headers, "ratelimit-limit-tokens"))
+        .or_else(|| parse_u64_header(headers, "anthropic-ratelimit-tokens-limit"));
+    let remaining = parse_u64_header(headers, "x-ratelimit-remaining-tokens")
+        .or_else(|| parse_u64_header(headers, "ratelimit-remaining-tokens"))
+        .or_else(|| parse_u64_header(headers, "anthropic-ratelimit-tokens-remaining"));
+    (limit, remaining)
+}
 
 pub(crate) fn is_minimax_intl_alias(name: &str) -> bool {
     matches!(
