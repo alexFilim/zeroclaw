@@ -515,6 +515,7 @@ pub(crate) async fn run_tool_call_loop_with_reply_target(
             ),
         )
         .await
+        .map(|r| r.text)
 }
 
 /// Run the tool loop with optional non-CLI approval context scoped to this task.
@@ -537,7 +538,7 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
-) -> Result<String> {
+) -> Result<ToolLoopResult> {
     let reply_target = non_cli_approval_context
         .as_ref()
         .map(|ctx| ctx.reply_target.clone());
@@ -1317,7 +1318,6 @@ pub(crate) async fn run_tool_call_loop(
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
                 tool_name, outcome.output
             );
-        }
         }
 
         // Add assistant message with tool calls + tool results to history.

@@ -858,12 +858,8 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
             }
         }
         "/restart" => Some(ChannelRuntimeCommand::RestartService),
-        "/approve-domain" => Some(ChannelRuntimeCommand::ApproveDomain(
-            parts.collect::<Vec<_>>().join(" ").trim().to_string(),
-        )),
-        "/deny-domain" => Some(ChannelRuntimeCommand::DenyDomain(
-            parts.collect::<Vec<_>>().join(" ").trim().to_string(),
-        )),
+        "/approve-domain" => Some(ChannelRuntimeCommand::ApproveDomain(tail.clone())),
+        "/deny-domain" => Some(ChannelRuntimeCommand::DenyDomain(tail)),
         _ => None,
     }
 }
