@@ -1070,7 +1070,6 @@ impl Provider for OpenAiCodexProvider {
             reasoning_content: None,
         })
     }
-
 }
 
 #[cfg(test)]
