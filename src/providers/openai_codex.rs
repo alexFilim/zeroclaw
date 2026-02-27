@@ -923,6 +923,18 @@ mod tests {
     }
 
     #[test]
+    fn resolve_reasoning_effort_prefers_runtime_override() {
+        assert_eq!(
+            resolve_reasoning_effort("gpt-5-codex", Some("minimal")),
+            "low".to_string()
+        );
+        assert_eq!(
+            resolve_reasoning_effort("gpt-5.3-codex", Some("xhigh")),
+            "xhigh".to_string()
+        );
+    }
+
+    #[test]
     fn parse_sse_text_reads_output_text_delta() {
         let payload = r#"data: {"type":"response.created","response":{"id":"resp_123"}}
 
