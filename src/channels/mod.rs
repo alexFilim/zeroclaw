@@ -4220,10 +4220,15 @@ or tune thresholds in config.",
         let draft_id = draft_id_ref.to_string();
         let suppress_internal_progress = !expose_internal_tool_details;
         Some(tokio::spawn(async move {
-            let mut accumulated = String::new();
+            // Each entry: (Option<call_idx_tag>, display_text).
+            // Tool entries (tagged) are updated in-place when the matching done marker arrives;
+            // all other entries are plain appends.
+            let mut entries: Vec<(Option<String>, String)> = Vec::new();
+            let start_marker = crate::agent::loop_::TOOL_PROGRESS_START_MARKER;
+            let done_marker = crate::agent::loop_::TOOL_PROGRESS_DONE_MARKER;
             while let Some(delta) = rx.recv().await {
                 if delta == crate::agent::loop_::DRAFT_CLEAR_SENTINEL {
-                    accumulated.clear();
+                    entries.clear();
                     continue;
                 }
                 let (is_internal_progress, visible_delta) = split_internal_progress_delta(&delta);
@@ -4231,7 +4236,33 @@ or tune thresholds in config.",
                     continue;
                 }
 
-                accumulated.push_str(visible_delta);
+                if let Some(rest) = visible_delta.strip_prefix(start_marker) {
+                    // Tool start: push new tagged entry so it can be replaced on completion.
+                    if let Some(sep) = rest.find('\x00') {
+                        entries.push((Some(rest[..sep].to_string()), rest[sep + 1..].to_string()));
+                    } else {
+                        entries.push((None, visible_delta.to_string()));
+                    }
+                } else if let Some(rest) = visible_delta.strip_prefix(done_marker) {
+                    // Tool done: replace the matching start entry in-place.
+                    if let Some(sep) = rest.find('\x00') {
+                        let tag = &rest[..sep];
+                        let new_line = rest[sep + 1..].to_string();
+                        if let Some(entry) =
+                            entries.iter_mut().find(|(t, _)| t.as_deref() == Some(tag))
+                        {
+                            entry.1 = new_line;
+                        } else {
+                            entries.push((Some(tag.to_string()), new_line));
+                        }
+                    } else {
+                        entries.push((None, visible_delta.to_string()));
+                    }
+                } else {
+                    entries.push((None, visible_delta.to_string()));
+                }
+
+                let accumulated: String = entries.iter().map(|(_, t)| t.as_str()).collect();
                 if let Err(e) = channel
                     .update_draft(&reply_target, &draft_id, &accumulated)
                     .await

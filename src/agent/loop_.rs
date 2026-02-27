@@ -123,6 +123,12 @@ pub(crate) const DRAFT_CLEAR_SENTINEL: &str = "\x00CLEAR\x00";
 /// Channel layers can suppress these messages by default and only expose them
 /// when the user explicitly asks for command/tool execution details.
 pub(crate) const DRAFT_PROGRESS_SENTINEL: &str = "\x00PROGRESS\x00";
+/// Marker prefix for a tagged tool-start progress line (enables in-place update on completion).
+/// Full payload after `DRAFT_PROGRESS_SENTINEL`: `TOOL_PROGRESS_START_MARKER{idx}\x00{line}\n`
+pub(crate) const TOOL_PROGRESS_START_MARKER: &str = "\x00TS:";
+/// Marker prefix for a tagged tool-done progress line (replaces the matching start line).
+/// Full payload after `DRAFT_PROGRESS_SENTINEL`: `TOOL_PROGRESS_DONE_MARKER{idx}\x00{line}\n`
+pub(crate) const TOOL_PROGRESS_DONE_MARKER: &str = "\x00TD:";
 
 tokio::task_local! {
     static TOOL_LOOP_REPLY_TARGET: Option<String>;
@@ -1207,14 +1213,16 @@ pub(crate) async fn run_tool_call_loop(
             // ── Progress: tool start ────────────────────────────
             if let Some(ref tx) = on_delta {
                 let hint = truncate_tool_args_for_progress(&tool_name, &tool_args, 60);
-                let progress = if hint.is_empty() {
+                let line = if hint.is_empty() {
                     format!("\u{23f3} {}\n", tool_name)
                 } else {
                     format!("\u{23f3} {}: {hint}\n", tool_name)
                 };
                 tracing::debug!(tool = %tool_name, "Sending progress start to draft");
                 let _ = tx
-                    .send(format!("{DRAFT_PROGRESS_SENTINEL}{progress}"))
+                    .send(format!(
+                        "{DRAFT_PROGRESS_SENTINEL}{TOOL_PROGRESS_START_MARKER}{idx}\x00{line}"
+                    ))
                     .await;
             }
 
@@ -1285,11 +1293,16 @@ pub(crate) async fn run_tool_call_loop(
                 } else {
                     "\u{274c}"
                 };
+                let hint = truncate_tool_args_for_progress(&call.name, &call.arguments, 60);
+                let line = if hint.is_empty() {
+                    format!("{icon} {} ({secs}s)\n", call.name)
+                } else {
+                    format!("{icon} {}: {hint} ({secs}s)\n", call.name)
+                };
                 tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
                 let _ = tx
                     .send(format!(
-                        "{DRAFT_PROGRESS_SENTINEL}{icon} {} ({secs}s)\n",
-                        call.name
+                        "{DRAFT_PROGRESS_SENTINEL}{TOOL_PROGRESS_DONE_MARKER}{idx}\x00{line}"
                     ))
                     .await;
             }
