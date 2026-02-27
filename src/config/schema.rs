@@ -2520,6 +2520,16 @@ pub struct AutonomyConfig {
     #[serde(default)]
     pub shell_env_passthrough: Vec<String>,
 
+    /// Show internal tool progress/log details by default in non-CLI channels.
+    ///
+    /// When `true`, channel responses may include execution progress snippets
+    /// (tool calls, interim progress lines) unless explicitly suppressed by
+    /// channel/message policy.
+    ///
+    /// When `false`, tool progress remains hidden unless explicitly requested.
+    #[serde(default = "default_true")]
+    pub show_internal_tool_logs: bool,
+
     /// Tools that never require approval (e.g. read-only tools).
     #[serde(default = "default_auto_approve")]
     pub auto_approve: Vec<String>,
@@ -2578,7 +2588,12 @@ pub struct AutonomyConfig {
 }
 
 fn default_auto_approve() -> Vec<String> {
-    vec!["file_read".into(), "memory_recall".into()]
+    vec![
+        "file_read".into(),
+        "memory_recall".into(),
+        "glob_search".into(),
+        "shell".into(),
+    ]
 }
 
 fn default_always_ask() -> Vec<String> {
@@ -2668,6 +2683,7 @@ impl Default for AutonomyConfig {
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             shell_env_passthrough: vec![],
+            show_internal_tool_logs: true,
             auto_approve: default_auto_approve(),
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
@@ -7335,6 +7351,9 @@ mod tests {
         assert!(a.require_approval_for_medium_risk);
         assert!(a.block_high_risk_commands);
         assert!(a.shell_env_passthrough.is_empty());
+        assert!(a.show_internal_tool_logs);
+        assert!(a.auto_approve.contains(&"shell".to_string()));
+        assert!(a.auto_approve.contains(&"glob_search".to_string()));
         assert!(a.non_cli_excluded_tools.contains(&"shell".to_string()));
         assert!(a.non_cli_excluded_tools.contains(&"delegate".to_string()));
     }
@@ -7356,6 +7375,7 @@ always_ask = []
 allowed_roots = []
 "#;
         let parsed: AutonomyConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.show_internal_tool_logs);
         assert!(parsed.non_cli_excluded_tools.contains(&"shell".to_string()));
         assert!(parsed
             .non_cli_excluded_tools
@@ -7522,6 +7542,7 @@ default_temperature = 0.7
                 require_approval_for_medium_risk: false,
                 block_high_risk_commands: true,
                 shell_env_passthrough: vec!["DATABASE_URL".into()],
+                show_internal_tool_logs: true,
                 auto_approve: vec!["file_read".into()],
                 always_ask: vec![],
                 allowed_roots: vec![],

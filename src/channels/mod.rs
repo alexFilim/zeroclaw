@@ -72,8 +72,8 @@ use crate::agent::loop_::{
     run_tool_call_loop_with_non_cli_approval_context, scrub_credentials, NonCliApprovalContext,
 };
 use crate::approval::{ApprovalManager, ApprovalResponse, PendingApprovalError};
-use crate::config::{Config, NonCliNaturalLanguageApprovalMode};
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
+use crate::config::{Config, NonCliNaturalLanguageApprovalMode};
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, runtime_trace, Observer};
@@ -219,6 +219,7 @@ struct ConfigFileStamp {
 struct RuntimeConfigState {
     defaults: ChannelRuntimeDefaults,
     perplexity_filter: crate::config::PerplexityFilterConfig,
+    show_internal_tool_logs: bool,
     last_applied_stamp: Option<ConfigFileStamp>,
 }
 
@@ -227,6 +228,7 @@ struct RuntimeAutonomyPolicy {
     auto_approve: Vec<String>,
     always_ask: Vec<String>,
     non_cli_excluded_tools: Vec<String>,
+    show_internal_tool_logs: bool,
     non_cli_approval_approvers: Vec<String>,
     non_cli_natural_language_approval_mode: NonCliNaturalLanguageApprovalMode,
     non_cli_natural_language_approval_mode_by_channel:
@@ -1069,6 +1071,7 @@ fn runtime_autonomy_policy_from_config(config: &Config) -> RuntimeAutonomyPolicy
         auto_approve: config.autonomy.auto_approve.clone(),
         always_ask: config.autonomy.always_ask.clone(),
         non_cli_excluded_tools: config.autonomy.non_cli_excluded_tools.clone(),
+        show_internal_tool_logs: config.autonomy.show_internal_tool_logs,
         non_cli_approval_approvers: config.autonomy.non_cli_approval_approvers.clone(),
         non_cli_natural_language_approval_mode: config
             .autonomy
@@ -1129,6 +1132,19 @@ fn snapshot_non_cli_excluded_tools(ctx: &ChannelRuntimeContext) -> Vec<String> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
+}
+
+fn snapshot_show_internal_tool_logs(ctx: &ChannelRuntimeContext) -> bool {
+    if let Some(config_path) = runtime_config_path(ctx) {
+        let store = runtime_config_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = store.get(&config_path) {
+            return state.show_internal_tool_logs;
+        }
+    }
+
+    true
 }
 
 fn filtered_tool_specs_for_runtime(
@@ -1546,6 +1562,11 @@ async fn describe_non_cli_approvals(
             excluded.join(", ")
         );
     }
+    let _ = writeln!(
+        response,
+        "- Runtime show_internal_tool_logs: {}",
+        snapshot_show_internal_tool_logs(ctx)
+    );
 
     let Some(config_path) = runtime_config_path(ctx) else {
         response.push_str(
@@ -1650,6 +1671,7 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
             RuntimeConfigState {
                 defaults: next_defaults.clone(),
                 perplexity_filter: next_autonomy_policy.perplexity_filter.clone(),
+                show_internal_tool_logs: next_autonomy_policy.show_internal_tool_logs,
                 last_applied_stamp: Some(stamp),
             },
         );
@@ -1679,6 +1701,7 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
             next_autonomy_policy.non_cli_natural_language_approval_mode
         ),
         non_cli_excluded_tools_count = next_autonomy_policy.non_cli_excluded_tools.len(),
+        show_internal_tool_logs = next_autonomy_policy.show_internal_tool_logs,
         perplexity_filter_enabled = next_autonomy_policy.perplexity_filter.enable_perplexity_filter,
         perplexity_threshold = next_autonomy_policy.perplexity_filter.perplexity_threshold,
         "Applied updated channel runtime config from disk"
@@ -4150,8 +4173,9 @@ or tune thresholds in config.",
         }
     }
 
-    let expose_internal_tool_details =
-        msg.channel == "cli" || should_expose_internal_tool_details(&msg.content);
+    let expose_internal_tool_details = msg.channel == "cli"
+        || snapshot_show_internal_tool_logs(ctx.as_ref())
+        || should_expose_internal_tool_details(&msg.content);
     let excluded_tools_snapshot = if msg.channel == "cli" {
         Vec::new()
     } else {
@@ -5932,6 +5956,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             RuntimeConfigState {
                 defaults: runtime_defaults_from_config(&config),
                 perplexity_filter: config.security.perplexity_filter.clone(),
+                show_internal_tool_logs: config.autonomy.show_internal_tool_logs,
                 last_applied_stamp: initial_stamp,
             },
         );
@@ -7550,7 +7575,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn process_channel_message_streaming_hides_internal_progress_by_default() {
+    async fn process_channel_message_streaming_shows_internal_progress_by_default() {
         let channel_impl = Arc::new(DraftStreamingRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -7611,13 +7636,13 @@ BTC is currently around $65,000 based on latest tool output."#
             "draft updates should still include streamed final answer"
         );
         assert!(
-            !updates.iter().any(|entry| {
+            updates.iter().any(|entry| {
                 entry.contains("Thinking")
                     || entry.contains("Got 1 tool call(s)")
                     || entry.contains("mock_price")
                     || entry.contains("⏳")
             }),
-            "internal tool progress should stay hidden by default, got updates: {updates:?}"
+            "internal tool progress should be visible by default, got updates: {updates:?}"
         );
         drop(updates);
 
@@ -7693,6 +7718,108 @@ BTC is currently around $65,000 based on latest tool output."#
             updates.iter().any(|entry| entry.contains("Thinking")),
             "explicit requests should expose internal thinking/progress text, got updates: {updates:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_streaming_hides_internal_progress_when_configured() {
+        let channel_impl = Arc::new(DraftStreamingRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        {
+            let mut store = runtime_config_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            store.insert(
+                config_path.clone(),
+                RuntimeConfigState {
+                    defaults: ChannelRuntimeDefaults {
+                        default_provider: "test-provider".to_string(),
+                        model: "test-model".to_string(),
+                        reasoning_enabled: None,
+                        reasoning_effort: None,
+                        temperature: 0.0,
+                        api_key: None,
+                        api_url: None,
+                        reliability: crate::config::ReliabilityConfig::default(),
+                    },
+                    perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+                    show_internal_tool_logs: false,
+                    last_applied_stamp: None,
+                },
+            );
+        }
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(ToolCallingProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                zeroclaw_dir: Some(temp.path().to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-stream-hide-setting".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-stream".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "draft-streaming-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let updates = channel_impl.draft_updates.lock().await;
+        assert!(
+            !updates.iter().any(|entry| {
+                entry.contains("Thinking")
+                    || entry.contains("Got 1 tool call(s)")
+                    || entry.contains("mock_price")
+                    || entry.contains("⏳")
+            }),
+            "internal tool progress should stay hidden when configured off, got updates: {updates:?}"
+        );
+
+        let mut store = runtime_config_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        store.remove(&config_path);
     }
 
     #[tokio::test]
@@ -9581,6 +9708,7 @@ BTC is currently around $65,000 based on latest tool output."#
                         reliability: crate::config::ReliabilityConfig::default(),
                     },
                     perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+                    show_internal_tool_logs: true,
                     last_applied_stamp: None,
                 },
             );
@@ -9670,6 +9798,7 @@ BTC is currently around $65,000 based on latest tool output."#
         cfg.autonomy.auto_approve = vec!["mock_price".to_string()];
         cfg.autonomy.always_ask = vec!["shell".to_string()];
         cfg.autonomy.non_cli_excluded_tools = vec!["browser_open".to_string()];
+        cfg.autonomy.show_internal_tool_logs = false;
         cfg.autonomy.non_cli_approval_approvers = vec!["telegram:alice".to_string()];
         cfg.autonomy.non_cli_natural_language_approval_mode =
             crate::config::NonCliNaturalLanguageApprovalMode::Direct;
@@ -9693,6 +9822,7 @@ BTC is currently around $65,000 based on latest tool output."#
             policy.non_cli_excluded_tools,
             vec!["browser_open".to_string()]
         );
+        assert!(!policy.show_internal_tool_logs);
         assert_eq!(
             policy.non_cli_approval_approvers,
             vec!["telegram:alice".to_string()]
@@ -9728,6 +9858,7 @@ BTC is currently around $65,000 based on latest tool output."#
         cfg.autonomy.non_cli_natural_language_approval_mode =
             crate::config::NonCliNaturalLanguageApprovalMode::Direct;
         cfg.autonomy.non_cli_excluded_tools = vec!["shell".to_string()];
+        cfg.autonomy.show_internal_tool_logs = false;
         cfg.security.perplexity_filter.enable_perplexity_filter = false;
         cfg.save().await.expect("save initial config");
 
@@ -9781,6 +9912,7 @@ BTC is currently around $65,000 based on latest tool output."#
             snapshot_non_cli_excluded_tools(runtime_ctx.as_ref()),
             vec!["shell".to_string()]
         );
+        assert!(!snapshot_show_internal_tool_logs(runtime_ctx.as_ref()));
         assert!(!runtime_perplexity_filter_snapshot(runtime_ctx.as_ref()).enable_perplexity_filter);
 
         cfg.autonomy.non_cli_natural_language_approval_mode =
@@ -9793,6 +9925,7 @@ BTC is currently around $65,000 based on latest tool output."#
             );
         cfg.autonomy.non_cli_excluded_tools =
             vec!["browser_open".to_string(), "mock_price".to_string()];
+        cfg.autonomy.show_internal_tool_logs = true;
         cfg.security.perplexity_filter.enable_perplexity_filter = true;
         cfg.security.perplexity_filter.perplexity_threshold = 12.5;
         cfg.save().await.expect("save updated config");
@@ -9817,6 +9950,7 @@ BTC is currently around $65,000 based on latest tool output."#
             snapshot_non_cli_excluded_tools(runtime_ctx.as_ref()),
             vec!["browser_open".to_string(), "mock_price".to_string()]
         );
+        assert!(snapshot_show_internal_tool_logs(runtime_ctx.as_ref()));
         let perplexity_cfg = runtime_perplexity_filter_snapshot(runtime_ctx.as_ref());
         assert!(perplexity_cfg.enable_perplexity_filter);
         assert_eq!(perplexity_cfg.perplexity_threshold, 12.5);
