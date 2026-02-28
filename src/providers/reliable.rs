@@ -8,6 +8,17 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+/// Sentinel kept in sync with `agent::loop_::DRAFT_PROGRESS_SENTINEL`.
+/// Defined here so `providers` does not depend on `agent`.
+const DRAFT_PROGRESS_SENTINEL: &str = "\x00PROGRESS\x00";
+
+tokio::task_local! {
+    /// Optional mpsc sender for surfacing provider retry/failure events to the
+    /// active channel draft message. Set by `agent::loop_` before each provider
+    /// call; absent (None) outside of an agent loop context.
+    pub(crate) static PROVIDER_RETRY_PROGRESS_TX: Option<tokio::sync::mpsc::Sender<String>>;
+}
+
 // ── Error Classification ─────────────────────────────────────────────────
 // Errors are split into retryable (transient server/network failures) and
 // non-retryable (permanent client errors). This distinction drives whether
@@ -461,6 +472,20 @@ impl Provider for ReliableProvider {
                                         error = %error_detail,
                                         "Provider call failed, retrying"
                                     );
+                                    // Surface the retry event to the active channel draft so
+                                    // the user sees it immediately instead of a silent "...".
+                                    let retry_line = format!(
+                                        "{DRAFT_PROGRESS_SENTINEL}⚠️ Attempt {}/{} failed ({}): {}\n",
+                                        attempt + 1,
+                                        self.max_retries + 1,
+                                        provider_name,
+                                        error_detail,
+                                    );
+                                    let _ = PROVIDER_RETRY_PROGRESS_TX.try_with(|opt| {
+                                        if let Some(tx) = opt.as_ref() {
+                                            let _ = tx.try_send(retry_line);
+                                        }
+                                    });
                                     tokio::time::sleep(Duration::from_millis(wait)).await;
                                     backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                                 }
@@ -584,6 +609,20 @@ impl Provider for ReliableProvider {
                                         error = %error_detail,
                                         "Provider call failed, retrying"
                                     );
+                                    // Surface the retry event to the active channel draft so
+                                    // the user sees it immediately instead of a silent "...".
+                                    let retry_line = format!(
+                                        "{DRAFT_PROGRESS_SENTINEL}⚠️ Attempt {}/{} failed ({}): {}\n",
+                                        attempt + 1,
+                                        self.max_retries + 1,
+                                        provider_name,
+                                        error_detail,
+                                    );
+                                    let _ = PROVIDER_RETRY_PROGRESS_TX.try_with(|opt| {
+                                        if let Some(tx) = opt.as_ref() {
+                                            let _ = tx.try_send(retry_line);
+                                        }
+                                    });
                                     tokio::time::sleep(Duration::from_millis(wait)).await;
                                     backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                                 }
@@ -715,6 +754,20 @@ impl Provider for ReliableProvider {
                                         error = %error_detail,
                                         "Provider call failed, retrying"
                                     );
+                                    // Surface the retry event to the active channel draft so
+                                    // the user sees it immediately instead of a silent "...".
+                                    let retry_line = format!(
+                                        "{DRAFT_PROGRESS_SENTINEL}⚠️ Attempt {}/{} failed ({}): {}\n",
+                                        attempt + 1,
+                                        self.max_retries + 1,
+                                        provider_name,
+                                        error_detail,
+                                    );
+                                    let _ = PROVIDER_RETRY_PROGRESS_TX.try_with(|opt| {
+                                        if let Some(tx) = opt.as_ref() {
+                                            let _ = tx.try_send(retry_line);
+                                        }
+                                    });
                                     tokio::time::sleep(Duration::from_millis(wait)).await;
                                     backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                                 }
@@ -831,6 +884,20 @@ impl Provider for ReliableProvider {
                                         error = %error_detail,
                                         "Provider call failed, retrying"
                                     );
+                                    // Surface the retry event to the active channel draft so
+                                    // the user sees it immediately instead of a silent "...".
+                                    let retry_line = format!(
+                                        "{DRAFT_PROGRESS_SENTINEL}⚠️ Attempt {}/{} failed ({}): {}\n",
+                                        attempt + 1,
+                                        self.max_retries + 1,
+                                        provider_name,
+                                        error_detail,
+                                    );
+                                    let _ = PROVIDER_RETRY_PROGRESS_TX.try_with(|opt| {
+                                        if let Some(tx) = opt.as_ref() {
+                                            let _ = tx.try_send(retry_line);
+                                        }
+                                    });
                                     tokio::time::sleep(Duration::from_millis(wait)).await;
                                     backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                                 }
