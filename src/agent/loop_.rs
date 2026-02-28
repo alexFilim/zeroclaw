@@ -934,8 +934,8 @@ pub(crate) async fn run_tool_call_loop(
             // If a streaming sender is provided, relay the text in small chunks
             // so the channel can progressively update the draft message.
             if let Some(ref tx) = on_delta {
-                // Clear accumulated progress lines before streaming the final answer.
-                let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                // Keep accumulated progress lines visible; the final answer streams
+                // directly below them so the user can see which tools ran.
                 // Split on whitespace boundaries, accumulating chunks of at least
                 // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
                 let mut chunk = String::new();
