@@ -735,13 +735,22 @@ pub(crate) async fn run_tool_call_loop(
             temperature,
         );
 
+        // Scope the retry-progress sender so reliable.rs can surface provider
+        // retry events directly into the channel draft without a circular import.
+        let retry_tx = on_delta.clone();
         let chat_result = if let Some(token) = cancellation_token.as_ref() {
-            tokio::select! {
-                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                result = chat_future => result,
-            }
+            crate::providers::reliable::PROVIDER_RETRY_PROGRESS_TX
+                .scope(retry_tx, async {
+                    tokio::select! {
+                        () = token.cancelled() => Err(ToolLoopCancelled.into()),
+                        result = chat_future => result,
+                    }
+                })
+                .await
         } else {
-            chat_future.await
+            crate::providers::reliable::PROVIDER_RETRY_PROGRESS_TX
+                .scope(retry_tx, chat_future)
+                .await
         };
 
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
