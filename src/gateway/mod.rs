@@ -365,6 +365,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             secrets_encrypt: config.secrets.encrypt,
             reasoning_enabled: config.runtime.reasoning_enabled,
             reasoning_level: config.effective_provider_reasoning_level(),
+            reasoning_effort: None,
             custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
             max_tokens_override: None,
             model_support_vision: config.model_support_vision,
@@ -432,6 +433,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // SSE broadcast channel for real-time events
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
+    crate::observability::set_runtime_event_sender(event_tx.clone());
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -660,12 +662,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         hooks.fire_gateway_start(host, actual_port).await;
     }
 
-    // Wrap observer with broadcast capability for SSE
+    // Observer events are forwarded to the shared runtime event stream that
+    // powers `/api/events` and frontend `/logs`.
     let broadcast_observer: Arc<dyn crate::observability::Observer> =
-        Arc::new(sse::BroadcastObserver::new(
-            crate::observability::create_observer(&config.observability),
-            event_tx.clone(),
-        ));
+        Arc::from(crate::observability::create_observer(&config.observability));
 
     let state = AppState {
         config: config_state,

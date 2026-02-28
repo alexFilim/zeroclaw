@@ -72,13 +72,17 @@ use crate::agent::loop_::{
     run_tool_call_loop_with_non_cli_approval_context, scrub_credentials, NonCliApprovalContext,
 };
 use crate::approval::{ApprovalManager, ApprovalResponse, PendingApprovalError};
+use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::config::{Config, NonCliNaturalLanguageApprovalMode};
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, runtime_trace, Observer};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
-use crate::security::{LeakDetector, LeakResult, SecurityPolicy};
+use crate::security::{
+    extract_domain_approval_host, normalize_domain_pattern, runtime_domain_policy, DomainListKind,
+    LeakDetector, LeakResult, SecurityPolicy,
+};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -147,13 +151,20 @@ fn channel_message_timeout_budget_secs(
 struct ChannelRouteSelection {
     provider: String,
     model: String,
+    reasoning_enabled: Option<bool>,
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChannelRuntimeCommand {
+    ShowStatus,
+    ShowChannels,
+    ShowUsage,
+    ShowSessions,
+    CompactConversation,
     ShowProviders,
     SetProvider(String),
-    ShowModel,
+    ShowModels,
     SetModel(String),
     NewSession,
     RequestAllToolsOnce,
@@ -165,6 +176,12 @@ enum ChannelRuntimeCommand {
     ApproveTool(String),
     UnapproveTool(String),
     ListApprovals,
+    ShowThink,
+    SetThink(Option<bool>),
+    SetThinkEffort(String),
+    ApproveDomain(String),
+    DenyDomain(String),
+    RestartService,
 }
 
 const APPROVAL_ALL_TOOLS_ONCE_TOKEN: &str = "__all_tools_once__";
@@ -184,6 +201,8 @@ struct ModelCacheEntry {
 struct ChannelRuntimeDefaults {
     default_provider: String,
     model: String,
+    reasoning_enabled: Option<bool>,
+    reasoning_effort: Option<String>,
     temperature: f64,
     api_key: Option<String>,
     api_url: Option<String>,
@@ -200,6 +219,7 @@ struct ConfigFileStamp {
 struct RuntimeConfigState {
     defaults: ChannelRuntimeDefaults,
     perplexity_filter: crate::config::PerplexityFilterConfig,
+    show_internal_tool_logs: bool,
     last_applied_stamp: Option<ConfigFileStamp>,
 }
 
@@ -208,6 +228,7 @@ struct RuntimeAutonomyPolicy {
     auto_approve: Vec<String>,
     always_ask: Vec<String>,
     non_cli_excluded_tools: Vec<String>,
+    show_internal_tool_logs: bool,
     non_cli_approval_approvers: Vec<String>,
     non_cli_natural_language_approval_mode: NonCliNaturalLanguageApprovalMode,
     non_cli_natural_language_approval_mode_by_channel:
@@ -218,6 +239,44 @@ struct RuntimeAutonomyPolicy {
 fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>> {
     static STORE: OnceLock<Mutex<HashMap<PathBuf, RuntimeConfigState>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn in_flight_sender_store() -> &'static tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>
+{
+    static STORE: OnceLock<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>> =
+        OnceLock::new();
+    STORE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+#[derive(Debug, Clone)]
+struct ChannelUsageSnapshot {
+    provider: String,
+    model: String,
+    reasoning_enabled: Option<bool>,
+    reasoning_effort: Option<String>,
+    history_messages: usize,
+    context_chars: usize,
+    est_context_tokens: u64,
+    last_response_chars: usize,
+    est_last_response_tokens: u64,
+    est_total_input_tokens: u64,
+    est_total_output_tokens: u64,
+    provider_token_limit: Option<u64>,
+    provider_token_remaining: Option<u64>,
+    provider_rate_limit_summary: Option<String>,
+    turns_completed: u64,
+    updated_at: SystemTime,
+}
+
+fn usage_store() -> &'static Mutex<HashMap<String, ChannelUsageSnapshot>> {
+    static STORE: OnceLock<Mutex<HashMap<String, ChannelUsageSnapshot>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn pending_limit_store() -> &'static tokio::sync::Mutex<HashMap<String, PendingLimitContinuation>> {
+    static STORE: OnceLock<tokio::sync::Mutex<HashMap<String, PendingLimitContinuation>>> =
+        OnceLock::new();
+    STORE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
 const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "zeroclaw.service"];
@@ -264,6 +323,12 @@ struct InFlightSenderTaskState {
     completion: Arc<InFlightTaskCompletion>,
 }
 
+#[derive(Debug, Clone)]
+struct PendingLimitContinuation {
+    prepared_content: String,
+    prompt_summary: String,
+}
+
 struct InFlightTaskCompletion {
     done: AtomicBool,
     notify: tokio::sync::Notify,
@@ -299,15 +364,43 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
 }
 
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
-    // Include thread_ts for per-topic session isolation in forum groups
+    // Include thread_ts for per-topic session isolation in forum groups.
+    // Session identity is scoped to channel + reply target (chat/session endpoint).
     match &msg.thread_ts {
-        Some(tid) => format!("{}_{}_{}", msg.channel, tid, msg.sender),
-        None => format!("{}_{}", msg.channel, msg.sender),
+        Some(tid) => format!("{}_{}_{}", msg.channel, tid, msg.reply_target),
+        None => format!("{}_{}", msg.channel, msg.reply_target),
     }
 }
 
 fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
+}
+
+fn normalize_slash_command_token(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+
+    Some(
+        trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .split('@')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+    )
+}
+
+fn is_pending_limit_continue_command(content: &str) -> bool {
+    normalize_slash_command_token(content).is_some_and(|command| command == "/continue")
+}
+
+fn is_pending_limit_cancel_command(content: &str) -> bool {
+    normalize_slash_command_token(content)
+        .is_some_and(|command| command == "/cancel-limit" || command == "/cancel")
 }
 
 /// Strip tool-call XML tags from outgoing messages.
@@ -702,35 +795,73 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
     let tail = args.join(" ").trim().to_string();
 
     match base_command.as_str() {
+        "/status" => Some(ChannelRuntimeCommand::ShowStatus),
+        "/channels" => Some(ChannelRuntimeCommand::ShowChannels),
         // History reset commands are safe for all channels.
         "/new" | "/clear" => Some(ChannelRuntimeCommand::NewSession),
         "/approve-all-once" => Some(ChannelRuntimeCommand::RequestAllToolsOnce),
-        "/approve-request" => Some(ChannelRuntimeCommand::RequestToolApproval(tail)),
-        "/approve-confirm" => Some(ChannelRuntimeCommand::ConfirmToolApproval(tail)),
-        "/approve-allow" => Some(ChannelRuntimeCommand::ApprovePendingRequest(tail)),
-        "/approve-deny" => Some(ChannelRuntimeCommand::DenyToolApproval(tail)),
+        "/approve-request" => Some(ChannelRuntimeCommand::RequestToolApproval(tail.clone())),
+        "/approve-confirm" => Some(ChannelRuntimeCommand::ConfirmToolApproval(tail.clone())),
+        "/approve-allow" => Some(ChannelRuntimeCommand::ApprovePendingRequest(tail.clone())),
+        "/approve-deny" => Some(ChannelRuntimeCommand::DenyToolApproval(tail.clone())),
         "/approve-pending" => Some(ChannelRuntimeCommand::ListPendingApprovals),
-        "/approve" => Some(ChannelRuntimeCommand::ApproveTool(tail)),
-        "/unapprove" => Some(ChannelRuntimeCommand::UnapproveTool(tail)),
+        "/approve" => Some(ChannelRuntimeCommand::ApproveTool(tail.clone())),
+        "/unapprove" => Some(ChannelRuntimeCommand::UnapproveTool(tail.clone())),
         "/approvals" => Some(ChannelRuntimeCommand::ListApprovals),
-        // Provider/model switching remains limited to channels with session routing.
-        "/models" if supports_runtime_model_switch(channel_name) => {
-            if let Some(provider) = args.first() {
-                Some(ChannelRuntimeCommand::SetProvider(
-                    provider.trim().to_string(),
-                ))
-            } else {
+        "/usage" => Some(ChannelRuntimeCommand::ShowUsage),
+        "/sessions" => Some(ChannelRuntimeCommand::ShowSessions),
+        "/compact" => Some(ChannelRuntimeCommand::CompactConversation),
+        "/providers" => {
+            if tail.is_empty() {
                 Some(ChannelRuntimeCommand::ShowProviders)
+            } else {
+                Some(ChannelRuntimeCommand::SetProvider(tail.clone()))
             }
         }
-        "/model" if supports_runtime_model_switch(channel_name) => {
-            let model = tail;
+        "/provider" => {
+            if tail.is_empty() {
+                Some(ChannelRuntimeCommand::ShowProviders)
+            } else {
+                Some(ChannelRuntimeCommand::SetProvider(tail.clone()))
+            }
+        }
+        "/models" => {
+            if tail.is_empty() {
+                Some(ChannelRuntimeCommand::ShowModels)
+            } else {
+                Some(ChannelRuntimeCommand::SetModel(tail.clone()))
+            }
+        }
+        "/model" => {
+            let model = tail.clone();
             if model.is_empty() {
-                Some(ChannelRuntimeCommand::ShowModel)
+                Some(ChannelRuntimeCommand::ShowModels)
             } else {
                 Some(ChannelRuntimeCommand::SetModel(model))
             }
         }
+        "/think" => {
+            let value = args.first().map(|s| s.trim().to_ascii_lowercase());
+            match value.as_deref() {
+                None | Some("") => Some(ChannelRuntimeCommand::ShowThink),
+                Some("on" | "deep" | "true" | "1") => {
+                    Some(ChannelRuntimeCommand::SetThink(Some(true)))
+                }
+                Some("off" | "fast" | "false" | "0") => {
+                    Some(ChannelRuntimeCommand::SetThink(Some(false)))
+                }
+                Some("auto" | "default" | "normal" | "reset") => {
+                    Some(ChannelRuntimeCommand::SetThink(None))
+                }
+                Some("minimal" | "low" | "medium" | "high" | "xhigh") => Some(
+                    ChannelRuntimeCommand::SetThinkEffort(value.unwrap_or_default()),
+                ),
+                _ => Some(ChannelRuntimeCommand::ShowThink),
+            }
+        }
+        "/restart" => Some(ChannelRuntimeCommand::RestartService),
+        "/approve-domain" => Some(ChannelRuntimeCommand::ApproveDomain(tail.clone())),
+        "/deny-domain" => Some(ChannelRuntimeCommand::DenyDomain(tail)),
         _ => None,
     }
 }
@@ -865,6 +996,28 @@ fn non_cli_natural_language_mode_label(mode: NonCliNaturalLanguageApprovalMode) 
     }
 }
 
+fn is_abort_runtime_command(channel_name: &str, content: &str) -> bool {
+    if !supports_runtime_model_switch(channel_name) {
+        return false;
+    }
+
+    let trimmed = content.trim();
+    if !trimmed.starts_with('/') {
+        return false;
+    }
+
+    let command = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .split('@')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    command == "/abort"
+}
+
 fn resolve_provider_alias(name: &str) -> Option<String> {
     let candidate = name.trim();
     if candidate.is_empty() {
@@ -904,6 +1057,8 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
     ChannelRuntimeDefaults {
         default_provider: resolved_default_provider(config),
         model: resolved_default_model(config),
+        reasoning_enabled: config.runtime.reasoning_enabled,
+        reasoning_effort: None,
         temperature: config.default_temperature,
         api_key: config.api_key.clone(),
         api_url: config.api_url.clone(),
@@ -916,6 +1071,7 @@ fn runtime_autonomy_policy_from_config(config: &Config) -> RuntimeAutonomyPolicy
         auto_approve: config.autonomy.auto_approve.clone(),
         always_ask: config.autonomy.always_ask.clone(),
         non_cli_excluded_tools: config.autonomy.non_cli_excluded_tools.clone(),
+        show_internal_tool_logs: config.autonomy.show_internal_tool_logs,
         non_cli_approval_approvers: config.autonomy.non_cli_approval_approvers.clone(),
         non_cli_natural_language_approval_mode: config
             .autonomy
@@ -948,6 +1104,8 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
     ChannelRuntimeDefaults {
         default_provider: ctx.default_provider.as_str().to_string(),
         model: ctx.model.as_str().to_string(),
+        reasoning_enabled: ctx.provider_runtime_options.reasoning_enabled,
+        reasoning_effort: ctx.provider_runtime_options.reasoning_effort.clone(),
         temperature: ctx.temperature,
         api_key: ctx.api_key.clone(),
         api_url: ctx.api_url.clone(),
@@ -974,6 +1132,19 @@ fn snapshot_non_cli_excluded_tools(ctx: &ChannelRuntimeContext) -> Vec<String> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
+}
+
+fn snapshot_show_internal_tool_logs(ctx: &ChannelRuntimeContext) -> bool {
+    if let Some(config_path) = runtime_config_path(ctx) {
+        let store = runtime_config_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = store.get(&config_path) {
+            return state.show_internal_tool_logs;
+        }
+    }
+
+    true
 }
 
 fn filtered_tool_specs_for_runtime(
@@ -1391,6 +1562,11 @@ async fn describe_non_cli_approvals(
             excluded.join(", ")
         );
     }
+    let _ = writeln!(
+        response,
+        "- Runtime show_internal_tool_logs: {}",
+        snapshot_show_internal_tool_logs(ctx)
+    );
 
     let Some(config_path) = runtime_config_path(ctx) else {
         response.push_str(
@@ -1455,12 +1631,14 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
 
     let (next_defaults, next_autonomy_policy) =
         load_runtime_defaults_from_config_file(&config_path).await?;
+    let mut runtime_options = ctx.provider_runtime_options.clone();
+    runtime_options.reasoning_enabled = next_defaults.reasoning_enabled;
     let next_default_provider = providers::create_resilient_provider_with_options(
         &next_defaults.default_provider,
         next_defaults.api_key.as_deref(),
         next_defaults.api_url.as_deref(),
         &next_defaults.reliability,
-        &ctx.provider_runtime_options,
+        &runtime_options,
     )?;
     let next_default_provider: Arc<dyn Provider> = Arc::from(next_default_provider);
 
@@ -1475,7 +1653,11 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         let mut cache = ctx.provider_cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.clear();
         cache.insert(
-            next_defaults.default_provider.clone(),
+            provider_cache_key(
+                &next_defaults.default_provider,
+                next_defaults.reasoning_enabled,
+                next_defaults.reasoning_effort.as_deref(),
+            ),
             Arc::clone(&next_default_provider),
         );
     }
@@ -1489,6 +1671,7 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
             RuntimeConfigState {
                 defaults: next_defaults.clone(),
                 perplexity_filter: next_autonomy_policy.perplexity_filter.clone(),
+                show_internal_tool_logs: next_autonomy_policy.show_internal_tool_logs,
                 last_applied_stamp: Some(stamp),
             },
         );
@@ -1518,6 +1701,7 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
             next_autonomy_policy.non_cli_natural_language_approval_mode
         ),
         non_cli_excluded_tools_count = next_autonomy_policy.non_cli_excluded_tools.len(),
+        show_internal_tool_logs = next_autonomy_policy.show_internal_tool_logs,
         perplexity_filter_enabled = next_autonomy_policy.perplexity_filter.enable_perplexity_filter,
         perplexity_threshold = next_autonomy_policy.perplexity_filter.perplexity_threshold,
         "Applied updated channel runtime config from disk"
@@ -1531,6 +1715,8 @@ fn default_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection
     ChannelRouteSelection {
         provider: defaults.default_provider,
         model: defaults.model,
+        reasoning_enabled: defaults.reasoning_enabled,
+        reasoning_effort: defaults.reasoning_effort,
     }
 }
 
@@ -1567,6 +1753,8 @@ fn classify_message_route(
     Some(ChannelRouteSelection {
         provider: route.provider.clone(),
         model: route.model.clone(),
+        reasoning_enabled: None,
+        reasoning_effort: None,
     })
 }
 
@@ -1585,6 +1773,10 @@ fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: Chan
 
 fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
     ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(sender_key);
+    usage_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(sender_key);
@@ -1696,6 +1888,165 @@ fn is_tool_iteration_limit_error(err: &anyhow::Error) -> bool {
     crate::agent::loop_::is_tool_iteration_limit_error(err)
 }
 
+fn domain_approval_prompt_from_error(err: &anyhow::Error) -> Option<String> {
+    let host = extract_domain_approval_host(&err.to_string())?;
+    Some(format!(
+        "🔐 Domain `{host}` is not approved.\nReply with `/approve-domain {host}` to allow, or `/deny-domain {host}` to block."
+    ))
+}
+
+fn format_mib(bytes: usize) -> String {
+    format!("{:.2}", bytes as f64 / (1024.0 * 1024.0))
+}
+
+fn compose_content_with_image_refs(cleaned_text: &str, refs: &[String]) -> String {
+    let trimmed = cleaned_text.trim();
+    if refs.is_empty() {
+        return trimmed.to_string();
+    }
+
+    if trimmed.is_empty() {
+        return refs
+            .iter()
+            .map(|reference| format!("[IMAGE:{reference}]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    format!(
+        "{trimmed}\n\n{}",
+        refs.iter()
+            .map(|reference| format!("[IMAGE:{reference}]"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+fn strip_image_markers_from_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> usize {
+    let mut histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(turns) = histories.get_mut(sender_key) else {
+        return 0;
+    };
+
+    let mut removed = 0usize;
+    for turn in turns.iter_mut() {
+        if turn.role != "user" {
+            continue;
+        }
+
+        let (cleaned_text, refs) = crate::multimodal::parse_image_markers(&turn.content);
+        if refs.is_empty() {
+            continue;
+        }
+
+        removed += refs.len();
+        turn.content = if cleaned_text.is_empty() {
+            "[Image attachments omitted after continuation approval]".to_string()
+        } else {
+            cleaned_text
+        };
+    }
+
+    removed
+}
+
+fn multimodal_limit_prompt_from_error(
+    err: &anyhow::Error,
+    original_content: &str,
+) -> Option<(String, PendingLimitContinuation)> {
+    use crate::multimodal::MultimodalError;
+
+    let multimodal_error = err.downcast_ref::<MultimodalError>()?;
+    let (cleaned_text, refs) = crate::multimodal::parse_image_markers(original_content);
+
+    match multimodal_error {
+        MultimodalError::TooManyImages { max_images, found } => {
+            let kept_refs = refs
+                .iter()
+                .take(*max_images)
+                .cloned()
+                .collect::<Vec<String>>();
+            let dropped_from_latest = refs.len().saturating_sub(kept_refs.len());
+
+            let mut prepared_content = compose_content_with_image_refs(&cleaned_text, &kept_refs);
+            if prepared_content.trim().is_empty() {
+                prepared_content =
+                    "Continue with the previous request using available context.".to_string();
+            }
+
+            let drop_note = if dropped_from_latest > 0 {
+                format!(
+                    "\n- dropping {} image(s) from your latest message",
+                    dropped_from_latest
+                )
+            } else {
+                String::new()
+            };
+
+            let prompt = format!(
+                "⚠️ Multimodal image limit reached.\nLimit: max_images={max_images}, found={found} image marker(s) in this request context.\nReply `/continue` to proceed safely by:\n- removing image markers from earlier turns in this chat{drop_note}\nReply `/cancel-limit` to cancel this request."
+            );
+
+            Some((
+                prompt,
+                PendingLimitContinuation {
+                    prepared_content,
+                    prompt_summary: format!(
+                        "kept {} image(s) from your latest message (dropped {}).",
+                        kept_refs.len(),
+                        dropped_from_latest
+                    ),
+                },
+            ))
+        }
+        MultimodalError::ImageTooLarge {
+            input,
+            size_bytes,
+            max_bytes,
+        } => {
+            let kept_refs = refs
+                .iter()
+                .filter(|reference| reference.as_str() != input.as_str())
+                .cloned()
+                .collect::<Vec<String>>();
+            let dropped_from_latest = refs.len().saturating_sub(kept_refs.len());
+
+            let mut prepared_content = compose_content_with_image_refs(&cleaned_text, &kept_refs);
+            if prepared_content.trim().is_empty() {
+                prepared_content =
+                    "Continue with the previous request using available context.".to_string();
+            }
+
+            let drop_note = if dropped_from_latest > 0 {
+                "\n- dropping the oversized image from your latest message"
+            } else {
+                "\n- removing image markers from earlier turns in this chat"
+            };
+
+            let prompt = format!(
+                "⚠️ Multimodal image size limit reached.\nImage: `{input}`\nSize: {} MiB (limit: {} MiB).\nReply `/continue` to proceed safely by:{drop_note}\nReply `/cancel-limit` to cancel this request.",
+                format_mib(*size_bytes),
+                format_mib(*max_bytes),
+            );
+
+            Some((
+                prompt,
+                PendingLimitContinuation {
+                    prepared_content,
+                    prompt_summary: format!(
+                        "removed oversized image marker(s) from latest message: {}.",
+                        dropped_from_latest
+                    ),
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<String> {
     let cache_path = workspace_dir.join("state").join(MODEL_CACHE_FILE);
     let Ok(raw) = std::fs::read_to_string(cache_path) else {
@@ -1719,22 +2070,35 @@ fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<S
         .unwrap_or_default()
 }
 
+fn provider_cache_key(
+    provider_name: &str,
+    reasoning_enabled: Option<bool>,
+    reasoning_effort: Option<&str>,
+) -> String {
+    let enabled_suffix = match reasoning_enabled {
+        Some(true) => "think:on",
+        Some(false) => "think:off",
+        None => "think:auto",
+    };
+    let effort_suffix = reasoning_effort.unwrap_or("effort:auto");
+    format!("{provider_name}|{enabled_suffix}|{effort_suffix}")
+}
+
 async fn get_or_create_provider(
     ctx: &ChannelRuntimeContext,
     provider_name: &str,
+    reasoning_enabled: Option<bool>,
+    reasoning_effort: Option<&str>,
 ) -> anyhow::Result<Arc<dyn Provider>> {
+    let cache_key = provider_cache_key(provider_name, reasoning_enabled, reasoning_effort);
     if let Some(existing) = ctx
         .provider_cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(provider_name)
+        .get(&cache_key)
         .cloned()
     {
         return Ok(existing);
-    }
-
-    if provider_name == ctx.default_provider.as_str() {
-        return Ok(Arc::clone(&ctx.provider));
     }
 
     let defaults = runtime_defaults_snapshot(ctx);
@@ -1744,12 +2108,16 @@ async fn get_or_create_provider(
         None
     };
 
+    let mut provider_runtime_options = ctx.provider_runtime_options.clone();
+    provider_runtime_options.reasoning_enabled = reasoning_enabled;
+    provider_runtime_options.reasoning_effort = reasoning_effort.map(ToString::to_string);
+
     let provider = create_resilient_provider_nonblocking(
         provider_name,
         ctx.api_key.clone(),
         api_url.map(ToString::to_string),
         ctx.reliability.as_ref().clone(),
-        ctx.provider_runtime_options.clone(),
+        provider_runtime_options,
     )
     .await?;
     let provider: Arc<dyn Provider> = Arc::from(provider);
@@ -1760,7 +2128,7 @@ async fn get_or_create_provider(
 
     let mut cache = ctx.provider_cache.lock().unwrap_or_else(|e| e.into_inner());
     let cached = cache
-        .entry(provider_name.to_string())
+        .entry(cache_key)
         .or_insert_with(|| Arc::clone(&provider));
     Ok(Arc::clone(cached))
 }
@@ -1788,12 +2156,18 @@ async fn create_resilient_provider_nonblocking(
 
 fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &Path) -> String {
     let mut response = String::new();
+    let think_level = match current.reasoning_enabled {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "auto",
+    };
     let _ = writeln!(
         response,
-        "Current provider: `{}`\nCurrent model: `{}`",
-        current.provider, current.model
+        "Current provider: `{}`\nCurrent model: `{}`\nReasoning: `{}`",
+        current.provider, current.model, think_level
     );
-    response.push_str("\nSwitch model with `/model <model-id>`.\n");
+    response.push_str("\nSwitch model with `/models <model-id>` or `/model <model-id>`.\n");
+    response.push_str("Switch provider with `/provider <provider>`.\n");
     response.push_str("Request supervised tool approval with `/approve-request <tool-name>`.\n");
     response.push_str("Request one-time all-tools approval with `/approve-all-once`.\n");
     response.push_str("Confirm approval with `/approve-confirm <request-id>`.\n");
@@ -1836,8 +2210,8 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
         "Current provider: `{}`\nCurrent model: `{}`",
         current.provider, current.model
     );
-    response.push_str("\nSwitch provider with `/models <provider>`.\n");
-    response.push_str("Switch model with `/model <model-id>`.\n\n");
+    response.push_str("\nSwitch provider with `/provider <provider>`.\n");
+    response.push_str("Switch model with `/models <model-id>`.\n\n");
     response.push_str("Request supervised tool approval with `/approve-request <tool-name>`.\n");
     response.push_str("Request one-time all-tools approval with `/approve-all-once`.\n");
     response.push_str("Confirm approval with `/approve-confirm <request-id>`.\n");
@@ -1865,6 +2239,448 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
         }
     }
     response
+}
+
+fn build_channels_help_response(ctx: &ChannelRuntimeContext) -> String {
+    let mut channel_names: Vec<_> = ctx.channels_by_name.keys().cloned().collect();
+    channel_names.sort();
+    let mut response = String::from("Active channels:\n");
+    for name in channel_names {
+        let _ = writeln!(response, "- {name}");
+    }
+    response
+}
+
+fn build_status_response(ctx: &ChannelRuntimeContext, current: &ChannelRouteSelection) -> String {
+    let snapshot = crate::health::snapshot();
+    let channels_total = ctx.channels_by_name.len();
+    let channels_healthy = snapshot
+        .components
+        .iter()
+        .filter(|(name, state)| name.starts_with("channel:") && state.status == "ok")
+        .count();
+    let thinking = match current.reasoning_enabled {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "auto",
+    };
+
+    format!(
+        "ZeroClaw status: running\nUptime: {}s\nPID: {}\nChannels: {}/{} healthy\nProvider: `{}`\nModel: `{}`\nReasoning: `{}`",
+        snapshot.uptime_seconds,
+        snapshot.pid,
+        channels_healthy,
+        channels_total,
+        current.provider,
+        current.model,
+        thinking
+    )
+}
+
+fn estimate_tokens_from_chars(chars: usize) -> u64 {
+    (chars as u64).div_ceil(4)
+}
+
+fn build_usage_response(sender_key: &str, current: &ChannelRouteSelection) -> String {
+    let usage_map = usage_store().lock().unwrap_or_else(|e| e.into_inner());
+    let maybe_usage = usage_map.get(sender_key).cloned();
+
+    let thinking = match current.reasoning_enabled {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "auto",
+    };
+    let effort = current.reasoning_effort.as_deref().unwrap_or("auto");
+
+    let Some(usage) = maybe_usage else {
+        let latest_provider_snapshot = usage_map
+            .values()
+            .filter(|entry| entry.provider == current.provider && entry.model == current.model)
+            .max_by_key(|entry| {
+                entry
+                    .updated_at
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs())
+            })
+            .cloned();
+        if let Some(provider_usage) = latest_provider_snapshot {
+            return format!(
+                "Usage snapshot for this session:\nProvider: `{}`\nModel: `{}`\nReasoning: `{}` (effort: `{}`)\nNo usage recorded yet for this sender.\nLatest provider snapshot in runtime:\nProvider token bucket: limit={} remaining={}\nProvider rate-limit details: {}",
+                current.provider,
+                current.model,
+                thinking,
+                effort,
+                provider_usage.provider_token_limit.map_or_else(|| "n/a".to_string(), |v| v.to_string()),
+                provider_usage.provider_token_remaining.map_or_else(|| "n/a".to_string(), |v| v.to_string()),
+                provider_usage.provider_rate_limit_summary.as_deref().unwrap_or("n/a"),
+            );
+        }
+        return format!(
+            "Usage snapshot for this session:\nProvider: `{}`\nModel: `{}`\nReasoning: `{}` (effort: `{}`)\nNo usage recorded yet for this sender.",
+            current.provider, current.model, thinking, effort
+        );
+    };
+
+    let updated_epoch = usage
+        .updated_at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+
+    format!(
+        "Usage snapshot for this session:\nProvider: `{}`\nModel: `{}`\nReasoning: `{}` (effort: `{}`)\nTurns completed: {}\nHistory messages: {}\nContext size: {} chars (~{} tokens)\nLast response: {} chars (~{} tokens)\nEstimated token totals: input={} output={} total={}\nProvider token bucket: limit={} remaining={}\nProvider rate-limit details: {}\nUpdated at (unix): {}",
+        usage.provider,
+        usage.model,
+        match usage.reasoning_enabled {
+            Some(true) => "on",
+            Some(false) => "off",
+            None => "auto",
+        },
+        usage.reasoning_effort.as_deref().unwrap_or("auto"),
+        usage.turns_completed,
+        usage.history_messages,
+        usage.context_chars,
+        usage.est_context_tokens,
+        usage.last_response_chars,
+        usage.est_last_response_tokens,
+        usage.est_total_input_tokens,
+        usage.est_total_output_tokens,
+        usage.est_total_input_tokens.saturating_add(usage.est_total_output_tokens),
+        usage.provider_token_limit.map_or_else(|| "n/a".to_string(), |v| v.to_string()),
+        usage.provider_token_remaining.map_or_else(|| "n/a".to_string(), |v| v.to_string()),
+        usage.provider_rate_limit_summary.as_deref().unwrap_or("n/a"),
+        updated_epoch
+    )
+}
+
+fn build_sessions_response(ctx: &ChannelRuntimeContext, channel_name: &str) -> String {
+    let prefix = format!("{channel_name}_");
+    let mut session_keys: Vec<String> = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .filter_map(|key| key.strip_prefix(&prefix).map(ToString::to_string))
+        .collect();
+    session_keys.sort();
+    session_keys.dedup();
+
+    if session_keys.is_empty() {
+        return "No active sessions for this channel.".to_string();
+    }
+
+    let mut response = format!("Active sessions ({}):\n", session_keys.len());
+    for key in session_keys {
+        let _ = writeln!(response, "- `{}`", key);
+    }
+    response
+}
+
+fn supported_reasoning_efforts_for_model(model: &str) -> &'static [&'static str] {
+    let id = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    if id == "gpt-5-codex" {
+        &["low", "medium", "high"]
+    } else if id.starts_with("gpt-5.2") || id.starts_with("gpt-5.3") || id == "gpt-5.1" {
+        &["low", "medium", "high", "xhigh"]
+    } else if id == "gpt-5.1-codex-mini" {
+        &["medium", "high"]
+    } else {
+        &["minimal", "low", "medium", "high", "xhigh"]
+    }
+}
+
+fn normalize_reasoning_effort_for_model(model: &str, requested: &str) -> Option<String> {
+    let effort = requested.trim().to_ascii_lowercase();
+    if effort.is_empty() {
+        return None;
+    }
+
+    let mut normalized = match effort.as_str() {
+        "minimal" => "minimal".to_string(),
+        "low" => "low".to_string(),
+        "medium" => "medium".to_string(),
+        "high" => "high".to_string(),
+        "xhigh" => "xhigh".to_string(),
+        _ => return None,
+    };
+
+    let allowed = supported_reasoning_efforts_for_model(model);
+    if allowed.iter().any(|v| *v == normalized) {
+        return Some(normalized);
+    }
+
+    normalized = match normalized.as_str() {
+        "minimal" if allowed.contains(&"low") => "low".to_string(),
+        "xhigh" if allowed.contains(&"high") => "high".to_string(),
+        "low" if allowed.contains(&"medium") => "medium".to_string(),
+        _ => return None,
+    };
+
+    Some(normalized)
+}
+
+fn build_think_response(current: &ChannelRouteSelection) -> String {
+    let level = match current.reasoning_enabled {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "auto",
+    };
+    let effort = current.reasoning_effort.as_deref().unwrap_or("auto");
+    let allowed = supported_reasoning_efforts_for_model(&current.model).join(", ");
+    format!(
+        "Current reasoning mode: `{level}`.\nCurrent effort: `{effort}`.\nSupported effort levels for `{}`: `{}`.\nUse `/think on`, `/think off`, `/think auto`, or `/think <level>`.",
+        current.model, allowed
+    )
+}
+
+fn build_domain_policy_update_response(raw_domain: &str, kind: DomainListKind) -> String {
+    let Some(domain) = normalize_domain_pattern(raw_domain) else {
+        return "Provide a valid domain: `/approve-domain example.com` or `/deny-domain example.com`.".to_string();
+    };
+
+    let Some(policy) = runtime_domain_policy() else {
+        return "Runtime domain policy store is unavailable.".to_string();
+    };
+
+    match policy.insert(&domain, kind, "runtime_command") {
+        Ok(()) => match kind {
+            DomainListKind::Allow => format!(
+                "Approved domain `{domain}`. Future browser/http calls to this host are allowed."
+            ),
+            DomainListKind::Deny => format!(
+                "Blocked domain `{domain}`. Future browser/http calls to this host are denied."
+            ),
+        },
+        Err(err) => format!("Failed to update domain policy for `{domain}`: {err}"),
+    }
+}
+
+fn quota_key_for_usage(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("weekly")
+        || key.contains("5h")
+        || key.contains("five")
+        || key.contains("hour")
+        || key.contains("remaining")
+        || key.contains("limit")
+        || key.contains("quota")
+        || key.contains("percent")
+        || key.contains("reset")
+}
+
+fn summarize_codex_usage_window_for_usage(
+    label: &str,
+    window: &serde_json::Value,
+) -> Option<String> {
+    let used_percent = window
+        .get("used_percent")
+        .and_then(serde_json::Value::as_u64)?;
+    let remaining_percent = 100_u64.saturating_sub(used_percent.min(100));
+    let reset_after = window
+        .get("reset_after_seconds")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_default();
+    let reset_at = window
+        .get("reset_at")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_default();
+    let reset_after_human = humanize_reset_after_seconds(reset_after);
+    let reset_at_human = humanize_unix_timestamp_utc(reset_at);
+    Some(format!(
+        "{label} remaining={remaining_percent}% (used={used_percent}%, reset in {reset_after_human}, reset at {reset_at_human})"
+    ))
+}
+
+fn humanize_reset_after_seconds(seconds: i64) -> String {
+    if seconds <= 0 {
+        return "now".to_string();
+    }
+    let mut remaining = seconds;
+    let days = remaining / 86_400;
+    remaining %= 86_400;
+    let hours = remaining / 3_600;
+    remaining %= 3_600;
+    let minutes = remaining / 60;
+    let secs = remaining % 60;
+
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{days}d"));
+    }
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if minutes > 0 {
+        parts.push(format!("{minutes}m"));
+    }
+    if secs > 0 && parts.is_empty() {
+        parts.push(format!("{secs}s"));
+    }
+    if parts.is_empty() {
+        "now".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn humanize_unix_timestamp_utc(timestamp: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| timestamp.to_string())
+}
+
+fn summarize_codex_usage_payload_for_usage(value: &serde_json::Value) -> Option<String> {
+    let rate_limit = value.get("rate_limit")?;
+    let mut parts = Vec::new();
+    if let Some(window) = rate_limit.get("primary_window") {
+        if let Some(summary) = summarize_codex_usage_window_for_usage("5h", window) {
+            parts.push(summary);
+        }
+    }
+    if let Some(window) = rate_limit.get("secondary_window") {
+        if let Some(summary) = summarize_codex_usage_window_for_usage("weekly", window) {
+            parts.push(summary);
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
+}
+
+fn collect_quota_pairs_for_usage(value: &serde_json::Value, path: &str, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let child_path = if path.is_empty() {
+                    k.to_string()
+                } else {
+                    format!("{path}.{k}")
+                };
+                if quota_key_for_usage(k) || quota_key_for_usage(&child_path) {
+                    match v {
+                        serde_json::Value::String(s) if !s.trim().is_empty() => {
+                            out.push(format!("{child_path}={}", s.trim()));
+                        }
+                        serde_json::Value::Number(n) => out.push(format!("{child_path}={n}")),
+                        serde_json::Value::Bool(b) => out.push(format!("{child_path}={b}")),
+                        _ => {}
+                    }
+                }
+                collect_quota_pairs_for_usage(v, &child_path, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for (idx, item) in arr.iter().enumerate() {
+                let child_path = if path.is_empty() {
+                    format!("[{idx}]")
+                } else {
+                    format!("{path}[{idx}]")
+                };
+                collect_quota_pairs_for_usage(item, &child_path, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn summarize_quota_payload_for_usage(value: &serde_json::Value) -> Option<String> {
+    if let Some(summary) = summarize_codex_usage_payload_for_usage(value) {
+        return Some(summary);
+    }
+
+    let mut pairs = Vec::new();
+    collect_quota_pairs_for_usage(value, "", &mut pairs);
+    if pairs.is_empty() {
+        None
+    } else {
+        pairs.sort();
+        pairs.dedup();
+        Some(pairs.join("; "))
+    }
+}
+
+async fn fetch_openai_codex_quota_summary_for_usage(ctx: &ChannelRuntimeContext) -> Option<String> {
+    let state_dir = ctx
+        .provider_runtime_options
+        .zeroclaw_dir
+        .clone()
+        .unwrap_or_else(|| {
+            directories::UserDirs::new().map_or_else(
+                || std::path::PathBuf::from(".zeroclaw"),
+                |dirs| dirs.home_dir().join(".zeroclaw"),
+            )
+        });
+    let auth =
+        crate::auth::AuthService::new(&state_dir, ctx.provider_runtime_options.secrets_encrypt);
+    let profile = auth
+        .get_profile(
+            "openai-codex",
+            ctx.provider_runtime_options
+                .auth_profile_override
+                .as_deref(),
+        )
+        .await
+        .ok()
+        .flatten();
+    let access_token = auth
+        .get_valid_openai_access_token(
+            ctx.provider_runtime_options
+                .auth_profile_override
+                .as_deref(),
+        )
+        .await
+        .ok()
+        .flatten()?;
+    let account_id = profile
+        .and_then(|profile| profile.account_id)
+        .or_else(|| extract_account_id_from_jwt(&access_token))?;
+
+    const ENDPOINTS: [&str; 5] = [
+        "https://chatgpt.com/backend-api/codex/usage",
+        "https://chatgpt.com/backend-api/codex/rate_limits",
+        "https://chatgpt.com/backend-api/codex/limits",
+        "https://chatgpt.com/backend-api/usage_limits",
+        "https://chatgpt.com/backend-api/limits",
+    ];
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+    for endpoint in ENDPOINTS {
+        let response = match client
+            .get(endpoint)
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("chatgpt-account-id", account_id.clone())
+            .header("originator", "pi")
+            .header("accept", "application/json")
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(_) => continue,
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(_) => continue,
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        if let Some(summary) = summarize_quota_payload_for_usage(&json) {
+            return Some(summary);
+        }
+    }
+    None
 }
 
 async fn handle_runtime_command_if_needed(
@@ -1994,19 +2810,89 @@ async fn handle_runtime_command_if_needed(
     }
 
     let response = match command {
+        ChannelRuntimeCommand::ShowStatus => build_status_response(ctx, &current),
+        ChannelRuntimeCommand::ShowChannels => build_channels_help_response(ctx),
+        ChannelRuntimeCommand::ShowUsage => {
+            let mut response = build_usage_response(&sender_key, &current);
+            if current.provider == "openai-codex" {
+                if let Some(summary) = fetch_openai_codex_quota_summary_for_usage(ctx).await {
+                    let _ = write!(response, "\nAccount quota details: {summary}");
+                }
+            }
+            response
+        }
+        ChannelRuntimeCommand::ShowSessions => build_sessions_response(ctx, &msg.channel),
+        ChannelRuntimeCommand::CompactConversation => {
+            let compacted = compact_sender_history(ctx, &sender_key);
+            if compacted {
+                "Conversation context compacted for this session.".to_string()
+            } else {
+                "Nothing to compact for this session yet.".to_string()
+            }
+        }
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
             match resolve_provider_alias(&raw_provider) {
-                Some(provider_name) => match get_or_create_provider(ctx, &provider_name).await {
+                Some(provider_name) => {
+                    match get_or_create_provider(
+                        ctx,
+                        &provider_name,
+                        current.reasoning_enabled,
+                        current.reasoning_effort.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            if provider_name != current.provider {
+                                current.provider = provider_name.clone();
+                                set_route_selection(ctx, &sender_key, current.clone());
+                                clear_sender_history(ctx, &sender_key);
+                            }
+
+                            format!(
+                            "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
+                            current.model
+                        )
+                        }
+                        Err(err) => {
+                            let safe_err = providers::sanitize_api_error(&err.to_string());
+                            format!(
+                            "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
+                        )
+                        }
+                    }
+                }
+                None => format!(
+                    "Unknown provider `{raw_provider}`. Use `/providers` to list valid providers."
+                ),
+            }
+        }
+        ChannelRuntimeCommand::ShowModels => {
+            build_models_help_response(&current, ctx.workspace_dir.as_path())
+        }
+        ChannelRuntimeCommand::SetModel(raw_model) => {
+            let model = raw_model.trim().trim_matches('`').to_string();
+            if model.is_empty() && msg.content.trim_start().starts_with("/models") {
+                build_models_help_response(&current, ctx.workspace_dir.as_path())
+            } else if model.is_empty() {
+                "Model ID cannot be empty. Use `/model <model-id>`.".to_string()
+            } else if let Some(provider_name) = resolve_provider_alias(&model) {
+                match get_or_create_provider(
+                    ctx,
+                    &provider_name,
+                    current.reasoning_enabled,
+                    current.reasoning_effort.as_deref(),
+                )
+                .await
+                {
                     Ok(_) => {
                         if provider_name != current.provider {
                             current.provider = provider_name.clone();
                             set_route_selection(ctx, &sender_key, current.clone());
                             clear_sender_history(ctx, &sender_key);
                         }
-
                         format!(
-                            "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
+                            "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/models` to list models.",
                             current.model
                         )
                     }
@@ -2016,21 +2902,13 @@ async fn handle_runtime_command_if_needed(
                             "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
                         )
                     }
-                },
-                None => format!(
-                    "Unknown provider `{raw_provider}`. Use `/models` to list valid providers."
-                ),
-            }
-        }
-        ChannelRuntimeCommand::ShowModel => {
-            build_models_help_response(&current, ctx.workspace_dir.as_path())
-        }
-        ChannelRuntimeCommand::SetModel(raw_model) => {
-            let model = raw_model.trim().trim_matches('`').to_string();
-            if model.is_empty() {
-                "Model ID cannot be empty. Use `/model <model-id>`.".to_string()
+                }
             } else {
                 current.model = model.clone();
+                if let Some(effort) = current.reasoning_effort.clone() {
+                    current.reasoning_effort =
+                        normalize_reasoning_effort_for_model(&current.model, &effort);
+                }
                 set_route_selection(ctx, &sender_key, current.clone());
                 clear_sender_history(ctx, &sender_key);
 
@@ -2510,6 +3388,59 @@ async fn handle_runtime_command_if_needed(
                 Err(err) => format!("Failed to read approval state: {err}"),
             }
         }
+        ChannelRuntimeCommand::ShowThink => build_think_response(&current),
+        ChannelRuntimeCommand::SetThink(next_reasoning_enabled) => {
+            current.reasoning_enabled = next_reasoning_enabled;
+            if next_reasoning_enabled != Some(true) {
+                current.reasoning_effort = None;
+            }
+            set_route_selection(ctx, &sender_key, current.clone());
+            clear_sender_history(ctx, &sender_key);
+            ctx.provider_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            build_think_response(&current)
+        }
+        ChannelRuntimeCommand::SetThinkEffort(requested_effort) => {
+            match normalize_reasoning_effort_for_model(&current.model, &requested_effort) {
+                Some(normalized_effort) => {
+                    current.reasoning_enabled = Some(true);
+                    current.reasoning_effort = Some(normalized_effort.clone());
+                    set_route_selection(ctx, &sender_key, current.clone());
+                    clear_sender_history(ctx, &sender_key);
+                    ctx.provider_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clear();
+                    let allowed = supported_reasoning_efforts_for_model(&current.model).join(", ");
+                    format!(
+                        "Reasoning effort set to `{normalized_effort}` for model `{}`.\nSupported levels for this model: `{}`.",
+                        current.model, allowed
+                    )
+                }
+                None => {
+                    let allowed = supported_reasoning_efforts_for_model(&current.model).join(", ");
+                    format!(
+                        "Reasoning level `{}` is not supported for model `{}`.\nSupported levels: `{}`.",
+                        requested_effort, current.model, allowed
+                    )
+                }
+            }
+        }
+        ChannelRuntimeCommand::ApproveDomain(raw_domain) => {
+            build_domain_policy_update_response(&raw_domain, DomainListKind::Allow)
+        }
+        ChannelRuntimeCommand::DenyDomain(raw_domain) => {
+            build_domain_policy_update_response(&raw_domain, DomainListKind::Deny)
+        }
+        ChannelRuntimeCommand::RestartService => match maybe_restart_managed_daemon_service() {
+            Ok(true) => "Restart requested. Managed daemon service is restarting now.".to_string(),
+            Ok(false) => {
+                "No managed daemon service detected. Restart manually from terminal.".to_string()
+            }
+            Err(err) => format!("Failed to restart managed daemon service: {err}"),
+        },
     };
 
     if let Err(err) = channel
@@ -2523,6 +3454,33 @@ async fn handle_runtime_command_if_needed(
     }
 
     true
+}
+
+async fn handle_abort_runtime_command(ctx: &ChannelRuntimeContext, msg: &traits::ChannelMessage) {
+    let Some(channel) = ctx.channels_by_name.get(&msg.channel) else {
+        return;
+    };
+
+    let sender_scope_key = interruption_scope_key(msg);
+    let cancelled = {
+        let mut active = in_flight_sender_store().lock().await;
+        active.remove(&sender_scope_key)
+    };
+
+    let response = if let Some(previous) = cancelled {
+        previous.cancellation.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(3), previous.completion.wait()).await;
+        "Abort requested. Stopped the current execution.".to_string()
+    } else {
+        "No active execution to abort.".to_string()
+    };
+
+    if let Err(err) = channel
+        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .await
+    {
+        tracing::warn!("Failed to send abort response on {}: {err}", channel.name());
+    }
 }
 
 async fn build_memory_context(
@@ -2998,7 +3956,7 @@ async fn process_channel_message(
     );
 
     // ── Hook: on_message_received (modifying) ────────────
-    let msg = if let Some(hooks) = &ctx.hooks {
+    let mut msg = if let Some(hooks) = &ctx.hooks {
         match hooks.run_on_message_received(msg).await {
             crate::hooks::HookResult::Cancel(reason) => {
                 tracing::info!(%reason, "incoming message dropped by hook");
@@ -3063,17 +4021,88 @@ or tune thresholds in config.",
         }
     }
 
+    let pending_scope_key = interruption_scope_key(&msg);
+    if is_pending_limit_cancel_command(&msg.content) {
+        let cancelled = pending_limit_store()
+            .lock()
+            .await
+            .remove(&pending_scope_key)
+            .is_some();
+        if let Some(channel) = target_channel.as_ref() {
+            let response = if cancelled {
+                "Cancelled the pending continuation request.".to_string()
+            } else {
+                "No pending continuation request to cancel.".to_string()
+            };
+            let _ = channel
+                .send(
+                    &SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()),
+                )
+                .await;
+        }
+        return;
+    }
+
+    if is_pending_limit_continue_command(&msg.content) {
+        let Some(pending) = pending_limit_store()
+            .lock()
+            .await
+            .remove(&pending_scope_key)
+        else {
+            if let Some(channel) = target_channel.as_ref() {
+                let _ = channel
+                    .send(
+                        &SendMessage::new(
+                            "No pending continuation request. Send a normal message first.",
+                            &msg.reply_target,
+                        )
+                        .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await;
+            }
+            return;
+        };
+
+        let history_key = conversation_history_key(&msg);
+        let removed_from_history =
+            strip_image_markers_from_sender_history(ctx.as_ref(), &history_key);
+
+        if let Some(channel) = target_channel.as_ref() {
+            let _ = channel
+                .send(
+                    &SendMessage::new(
+                        format!(
+                            "↪️ Continuing previous request.\n- {}\n- removed {} image marker(s) from earlier turns.",
+                            pending.prompt_summary, removed_from_history
+                        ),
+                        &msg.reply_target,
+                    )
+                    .in_thread(msg.thread_ts.clone()),
+                )
+                .await;
+        }
+
+        msg.content = pending.prepared_content;
+    }
+
     let history_key = conversation_history_key(&msg);
     // Try classification first, fall back to sender/default route
     let route = classify_message_route(ctx.as_ref(), &msg.content)
         .unwrap_or_else(|| get_route_selection(ctx.as_ref(), &history_key));
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
-    let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
+    let active_provider = match get_or_create_provider(
+        ctx.as_ref(),
+        &route.provider,
+        route.reasoning_enabled,
+        route.reasoning_effort.as_deref(),
+    )
+    .await
+    {
         Ok(provider) => provider,
         Err(err) => {
             let safe_err = providers::sanitize_api_error(&err.to_string());
             let message = format!(
-                "⚠️ Failed to initialize provider `{}`. Please run `/models` to choose another provider.\nDetails: {safe_err}",
+                "⚠️ Failed to initialize provider `{}`. Please run `/providers` to choose another provider.\nDetails: {safe_err}",
                 route.provider
             );
             if let Some(channel) = target_channel.as_ref() {
@@ -3144,8 +4173,9 @@ or tune thresholds in config.",
         }
     }
 
-    let expose_internal_tool_details =
-        msg.channel == "cli" || should_expose_internal_tool_details(&msg.content);
+    let expose_internal_tool_details = msg.channel == "cli"
+        || snapshot_show_internal_tool_logs(ctx.as_ref())
+        || should_expose_internal_tool_details(&msg.content);
     let excluded_tools_snapshot = if msg.channel == "cli" {
         Vec::new()
     } else {
@@ -3214,10 +4244,15 @@ or tune thresholds in config.",
         let draft_id = draft_id_ref.to_string();
         let suppress_internal_progress = !expose_internal_tool_details;
         Some(tokio::spawn(async move {
-            let mut accumulated = String::new();
+            // Each entry: (Option<call_idx_tag>, display_text).
+            // Tool entries (tagged) are updated in-place when the matching done marker arrives;
+            // all other entries are plain appends.
+            let mut entries: Vec<(Option<String>, String)> = Vec::new();
+            let start_marker = crate::agent::loop_::TOOL_PROGRESS_START_MARKER;
+            let done_marker = crate::agent::loop_::TOOL_PROGRESS_DONE_MARKER;
             while let Some(delta) = rx.recv().await {
                 if delta == crate::agent::loop_::DRAFT_CLEAR_SENTINEL {
-                    accumulated.clear();
+                    entries.clear();
                     continue;
                 }
                 let (is_internal_progress, visible_delta) = split_internal_progress_delta(&delta);
@@ -3225,7 +4260,33 @@ or tune thresholds in config.",
                     continue;
                 }
 
-                accumulated.push_str(visible_delta);
+                if let Some(rest) = visible_delta.strip_prefix(start_marker) {
+                    // Tool start: push new tagged entry so it can be replaced on completion.
+                    if let Some(sep) = rest.find('\x00') {
+                        entries.push((Some(rest[..sep].to_string()), rest[sep + 1..].to_string()));
+                    } else {
+                        entries.push((None, visible_delta.to_string()));
+                    }
+                } else if let Some(rest) = visible_delta.strip_prefix(done_marker) {
+                    // Tool done: replace the matching start entry in-place.
+                    if let Some(sep) = rest.find('\x00') {
+                        let tag = &rest[..sep];
+                        let new_line = rest[sep + 1..].to_string();
+                        if let Some(entry) =
+                            entries.iter_mut().find(|(t, _)| t.as_deref() == Some(tag))
+                        {
+                            entry.1 = new_line;
+                        } else {
+                            entries.push((Some(tag.to_string()), new_line));
+                        }
+                    } else {
+                        entries.push((None, visible_delta.to_string()));
+                    }
+                } else {
+                    entries.push((None, visible_delta.to_string()));
+                }
+
+                let accumulated: String = entries.iter().map(|(_, t)| t.as_str()).collect();
                 if let Err(e) = channel
                     .update_draft(&reply_target, &draft_id, &accumulated)
                     .await
@@ -3262,7 +4323,12 @@ or tune thresholds in config.",
     let history_len_before_tools = history.len();
 
     enum LlmExecutionResult {
-        Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
+        Completed(
+            Result<
+                Result<crate::agent::loop_::ToolLoopResult, anyhow::Error>,
+                tokio::time::error::Elapsed,
+            >,
+        ),
         Cancelled,
     }
 
@@ -3384,7 +4450,67 @@ or tune thresholds in config.",
                 }
             }
         }
-        LlmExecutionResult::Completed(Ok(Ok(response))) => {
+        LlmExecutionResult::Completed(Ok(Ok(loop_result))) => {
+            let response = loop_result.text;
+            let context_chars: usize = history.iter().map(|m| m.content.chars().count()).sum();
+            let last_response_chars = response.chars().count();
+            let est_context_tokens = estimate_tokens_from_chars(context_chars);
+            let est_last_response_tokens = estimate_tokens_from_chars(last_response_chars);
+            {
+                let mut usage_map = usage_store().lock().unwrap_or_else(|e| e.into_inner());
+                let usage_entry =
+                    usage_map
+                        .entry(history_key.clone())
+                        .or_insert_with(|| ChannelUsageSnapshot {
+                            provider: route.provider.clone(),
+                            model: route.model.clone(),
+                            reasoning_enabled: route.reasoning_enabled,
+                            reasoning_effort: route.reasoning_effort.clone(),
+                            history_messages: history.len(),
+                            context_chars,
+                            est_context_tokens,
+                            last_response_chars,
+                            est_last_response_tokens,
+                            est_total_input_tokens: 0,
+                            est_total_output_tokens: 0,
+                            provider_token_limit: None,
+                            provider_token_remaining: None,
+                            provider_rate_limit_summary: None,
+                            turns_completed: 0,
+                            updated_at: SystemTime::now(),
+                        });
+
+                usage_entry.provider = route.provider.clone();
+                usage_entry.model = route.model.clone();
+                usage_entry.reasoning_enabled = route.reasoning_enabled;
+                usage_entry.reasoning_effort = route.reasoning_effort.clone();
+                usage_entry.history_messages = history.len();
+                usage_entry.context_chars = context_chars;
+                usage_entry.est_context_tokens = est_context_tokens;
+                usage_entry.last_response_chars = last_response_chars;
+                usage_entry.est_last_response_tokens = est_last_response_tokens;
+                usage_entry.est_total_input_tokens = usage_entry
+                    .est_total_input_tokens
+                    .saturating_add(est_context_tokens);
+                usage_entry.est_total_output_tokens = usage_entry
+                    .est_total_output_tokens
+                    .saturating_add(est_last_response_tokens);
+                if let Some(provider_usage) = loop_result.usage.as_ref() {
+                    if provider_usage.token_limit.is_some() {
+                        usage_entry.provider_token_limit = provider_usage.token_limit;
+                    }
+                    if provider_usage.token_remaining.is_some() {
+                        usage_entry.provider_token_remaining = provider_usage.token_remaining;
+                    }
+                    if provider_usage.rate_limit_summary.is_some() {
+                        usage_entry.provider_rate_limit_summary =
+                            provider_usage.rate_limit_summary.clone();
+                    }
+                }
+                usage_entry.turns_completed = usage_entry.turns_completed.saturating_add(1);
+                usage_entry.updated_at = SystemTime::now();
+            }
+
             // ── Hook: on_message_sending (modifying) ─────────
             let mut outbound_response = response;
             if let Some(hooks) = &ctx.hooks {
@@ -3538,6 +4664,85 @@ or tune thresholds in config.",
                 {
                     if let Err(err) = channel.cancel_draft(&msg.reply_target, draft_id).await {
                         tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
+                    }
+                }
+            } else if let Some(approval_prompt) = domain_approval_prompt_from_error(&e) {
+                runtime_trace::record_event(
+                    "channel_domain_approval_required",
+                    Some(msg.channel.as_str()),
+                    Some(route.provider.as_str()),
+                    Some(route.model.as_str()),
+                    None,
+                    Some(false),
+                    Some("domain approval required"),
+                    serde_json::json!({
+                        "sender": msg.sender,
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                    }),
+                );
+                append_sender_turn(
+                    ctx.as_ref(),
+                    &history_key,
+                    ChatMessage::assistant("[Domain approval required — awaiting user decision]"),
+                );
+                if let Some(channel) = target_channel.as_ref() {
+                    if let Some(ref draft_id) = draft_message_id {
+                        let _ = channel
+                            .finalize_draft(&msg.reply_target, draft_id, &approval_prompt)
+                            .await;
+                    } else {
+                        let _ = channel
+                            .send(
+                                &SendMessage::new(approval_prompt, &msg.reply_target)
+                                    .in_thread(msg.thread_ts.clone()),
+                            )
+                            .await;
+                    }
+                }
+            } else if let Some((limit_prompt, pending)) =
+                multimodal_limit_prompt_from_error(&e, &msg.content)
+            {
+                runtime_trace::record_event(
+                    "channel_limit_confirmation_required",
+                    Some(msg.channel.as_str()),
+                    Some(route.provider.as_str()),
+                    Some(route.model.as_str()),
+                    None,
+                    Some(false),
+                    Some("multimodal limit confirmation required"),
+                    serde_json::json!({
+                        "sender": msg.sender,
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                        "error": providers::sanitize_api_error(&e.to_string()),
+                    }),
+                );
+                pending_limit_store()
+                    .lock()
+                    .await
+                    .insert(interruption_scope_key(&msg), pending);
+
+                let rolled_back =
+                    rollback_orphan_user_turn(ctx.as_ref(), &history_key, &msg.content);
+                if !rolled_back {
+                    append_sender_turn(
+                        ctx.as_ref(),
+                        &history_key,
+                        ChatMessage::assistant("[Limit reached — awaiting `/continue`]"),
+                    );
+                }
+
+                if let Some(channel) = target_channel.as_ref() {
+                    if let Some(ref draft_id) = draft_message_id {
+                        let _ = channel
+                            .finalize_draft(&msg.reply_target, draft_id, &limit_prompt)
+                            .await;
+                    } else {
+                        let _ = channel
+                            .send(
+                                &SendMessage::new(limit_prompt, &msg.reply_target)
+                                    .in_thread(msg.thread_ts.clone()),
+                            )
+                            .await;
                     }
                 }
             } else if is_context_window_overflow_error(&e) {
@@ -3737,20 +4942,20 @@ async fn run_message_dispatch_loop(
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let mut workers = tokio::task::JoinSet::new();
-    let in_flight_by_sender = Arc::new(tokio::sync::Mutex::new(HashMap::<
-        String,
-        InFlightSenderTaskState,
-    >::new()));
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
+        if is_abort_runtime_command(&msg.channel, &msg.content) {
+            handle_abort_runtime_command(ctx.as_ref(), &msg).await;
+            continue;
+        }
+
         let permit = match Arc::clone(&semaphore).acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => break,
         };
 
         let worker_ctx = Arc::clone(&ctx);
-        let in_flight = Arc::clone(&in_flight_by_sender);
         let task_sequence = Arc::clone(&task_sequence);
         workers.spawn(async move {
             let _permit = permit;
@@ -3761,19 +4966,19 @@ async fn run_message_dispatch_loop(
             let completion = Arc::new(InFlightTaskCompletion::new());
             let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
 
-            if interrupt_enabled {
-                let previous = {
-                    let mut active = in_flight.lock().await;
-                    active.insert(
-                        sender_scope_key.clone(),
-                        InFlightSenderTaskState {
-                            task_id,
-                            cancellation: cancellation_token.clone(),
-                            completion: Arc::clone(&completion),
-                        },
-                    )
-                };
+            let previous = {
+                let mut active = in_flight_sender_store().lock().await;
+                active.insert(
+                    sender_scope_key.clone(),
+                    InFlightSenderTaskState {
+                        task_id,
+                        cancellation: cancellation_token.clone(),
+                        completion: Arc::clone(&completion),
+                    },
+                )
+            };
 
+            if interrupt_enabled {
                 if let Some(previous) = previous {
                     tracing::info!(
                         channel = %msg.channel,
@@ -3787,14 +4992,12 @@ async fn run_message_dispatch_loop(
 
             process_channel_message(worker_ctx, msg, cancellation_token).await;
 
-            if interrupt_enabled {
-                let mut active = in_flight.lock().await;
-                if active
-                    .get(&sender_scope_key)
-                    .is_some_and(|state| state.task_id == task_id)
-                {
-                    active.remove(&sender_scope_key);
-                }
+            let mut active = in_flight_sender_store().lock().await;
+            if active
+                .get(&sender_scope_key)
+                .is_some_and(|state| state.task_id == task_id)
+            {
+                active.remove(&sender_scope_key);
             }
 
             completion.mark_done();
@@ -4331,7 +5534,7 @@ fn collect_configured_channels(
 
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
-            channel: Arc::new(telegram),
+            channel: Arc::new(telegram.with_transcription_api_key(config.api_key.clone())),
         });
     }
 
@@ -4721,6 +5924,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_level: config.effective_provider_reasoning_level(),
+        reasoning_effort: None,
         custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
         max_tokens_override: None,
         model_support_vision: config.model_support_vision,
@@ -4752,6 +5956,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             RuntimeConfigState {
                 defaults: runtime_defaults_from_config(&config),
                 perplexity_filter: config.security.perplexity_filter.clone(),
+                show_internal_tool_logs: config.autonomy.show_internal_tool_logs,
                 last_applied_stamp: initial_stamp,
             },
         );
@@ -4773,6 +5978,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
+    let mut seeded_allowed_domains = config.browser.allowed_domains.clone();
+    seeded_allowed_domains.extend(config.http_request.allowed_domains.iter().cloned());
+    if let Err(err) =
+        crate::security::init_runtime_domain_policy(&config.workspace_dir, &seeded_allowed_domains)
+    {
+        tracing::warn!("Failed to initialize runtime domain policy store: {err}");
+    }
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
             config.composio.api_key.as_deref(),
@@ -5043,7 +6255,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
 
     let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-    provider_cache_seed.insert(provider_name.clone(), Arc::clone(&provider));
+    provider_cache_seed.insert(
+        provider_cache_key(&provider_name, config.runtime.reasoning_enabled, None),
+        Arc::clone(&provider),
+    );
     let message_timeout_secs =
         effective_channel_message_timeout_secs(config.channels_config.message_timeout_secs);
     let interrupt_on_new_message = config
@@ -5120,6 +6335,7 @@ mod tests {
     use super::*;
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
+    use crate::providers::traits::ProviderCapabilities;
     use crate::providers::{ChatMessage, Provider};
     use crate::tools::{Tool, ToolResult};
     use std::collections::{HashMap, HashSet};
@@ -5969,6 +7185,46 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    #[derive(Default)]
+    struct VisionCaptureProvider {
+        calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for VisionCaptureProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                vision: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("fallback".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let snapshot = messages
+                .iter()
+                .map(|message| (message.role.clone(), message.content.clone()))
+                .collect::<Vec<_>>();
+            let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+            calls.push(snapshot);
+            Ok("vision-ok".to_string())
+        }
+    }
+
     struct MockPriceTool;
 
     #[derive(Default)]
@@ -6319,7 +7575,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn process_channel_message_streaming_hides_internal_progress_by_default() {
+    async fn process_channel_message_streaming_shows_internal_progress_by_default() {
         let channel_impl = Arc::new(DraftStreamingRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -6380,13 +7636,13 @@ BTC is currently around $65,000 based on latest tool output."#
             "draft updates should still include streamed final answer"
         );
         assert!(
-            !updates.iter().any(|entry| {
+            updates.iter().any(|entry| {
                 entry.contains("Thinking")
                     || entry.contains("Got 1 tool call(s)")
                     || entry.contains("mock_price")
                     || entry.contains("⏳")
             }),
-            "internal tool progress should stay hidden by default, got updates: {updates:?}"
+            "internal tool progress should be visible by default, got updates: {updates:?}"
         );
         drop(updates);
 
@@ -6462,6 +7718,108 @@ BTC is currently around $65,000 based on latest tool output."#
             updates.iter().any(|entry| entry.contains("Thinking")),
             "explicit requests should expose internal thinking/progress text, got updates: {updates:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_streaming_hides_internal_progress_when_configured() {
+        let channel_impl = Arc::new(DraftStreamingRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        {
+            let mut store = runtime_config_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            store.insert(
+                config_path.clone(),
+                RuntimeConfigState {
+                    defaults: ChannelRuntimeDefaults {
+                        default_provider: "test-provider".to_string(),
+                        model: "test-model".to_string(),
+                        reasoning_enabled: None,
+                        reasoning_effort: None,
+                        temperature: 0.0,
+                        api_key: None,
+                        api_url: None,
+                        reliability: crate::config::ReliabilityConfig::default(),
+                    },
+                    perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+                    show_internal_tool_logs: false,
+                    last_applied_stamp: None,
+                },
+            );
+        }
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(ToolCallingProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                zeroclaw_dir: Some(temp.path().to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            approval_manager: Arc::new(ApprovalManager::from_config(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-stream-hide-setting".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-stream".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "draft-streaming-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let updates = channel_impl.draft_updates.lock().await;
+        assert!(
+            !updates.iter().any(|entry| {
+                entry.contains("Thinking")
+                    || entry.contains("Got 1 tool call(s)")
+                    || entry.contains("mock_price")
+                    || entry.contains("⏳")
+            }),
+            "internal tool progress should stay hidden when configured off, got updates: {updates:?}"
+        );
+
+        let mut store = runtime_config_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        store.remove(&config_path);
     }
 
     #[tokio::test]
@@ -6606,8 +7964,14 @@ BTC is currently around $65,000 based on latest tool output."#
         let fallback_provider: Arc<dyn Provider> = fallback_provider_impl.clone();
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
-        provider_cache_seed.insert("openrouter".to_string(), fallback_provider);
+        provider_cache_seed.insert(
+            provider_cache_key("test-provider", None, None),
+            Arc::clone(&default_provider),
+        );
+        provider_cache_seed.insert(
+            provider_cache_key("openrouter", None, None),
+            fallback_provider,
+        );
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -7985,8 +9349,14 @@ BTC is currently around $65,000 based on latest tool output."#
         let routed_provider: Arc<dyn Provider> = routed_provider_impl.clone();
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
-        provider_cache_seed.insert("openrouter".to_string(), routed_provider);
+        provider_cache_seed.insert(
+            provider_cache_key("test-provider", None, None),
+            Arc::clone(&default_provider),
+        );
+        provider_cache_seed.insert(
+            provider_cache_key("openrouter", None, None),
+            routed_provider,
+        );
 
         let route_key = "telegram_alice".to_string();
         let mut route_overrides = HashMap::new();
@@ -7995,6 +9365,8 @@ BTC is currently around $65,000 based on latest tool output."#
             ChannelRouteSelection {
                 provider: "openrouter".to_string(),
                 model: "route-model".to_string(),
+                reasoning_enabled: None,
+                reasoning_effort: None,
             },
         );
 
@@ -8059,6 +9431,176 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn telegram_usage_command_message_includes_remaining_limits_details() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let sender = format!("usage_user_{}", uuid::Uuid::new_v4());
+        let reply_target = "chat-usage";
+        let sender_key = format!("telegram_{sender}");
+        let provider_name = format!("openai-codex-{}", uuid::Uuid::new_v4());
+        let model_name = "gpt-5.3-codex".to_string();
+
+        usage_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                sender_key.clone(),
+                ChannelUsageSnapshot {
+                    provider: provider_name.clone(),
+                    model: model_name.clone(),
+                    reasoning_enabled: None,
+                    reasoning_effort: Some("auto".to_string()),
+                    history_messages: 5,
+                    context_chars: 500,
+                    est_context_tokens: 125,
+                    last_response_chars: 120,
+                    est_last_response_tokens: 30,
+                    est_total_input_tokens: 1000,
+                    est_total_output_tokens: 200,
+                    provider_token_limit: Some(100_000),
+                    provider_token_remaining: Some(83_000),
+                    provider_rate_limit_summary: Some("weekly=5%; five_hour=75%".to_string()),
+                    turns_completed: 2,
+                    updated_at: SystemTime::now(),
+                },
+            );
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new(provider_name.clone()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new(model_name.clone()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-usage-1".to_string(),
+                sender,
+                reply_target: reply_target.to_string(),
+                content: "/usage".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        let payload = &sent_messages[0];
+        assert!(
+            payload.starts_with(&format!("{reply_target}:Usage snapshot for this session:")),
+            "expected usage response message, got: {payload}"
+        );
+        assert!(
+            payload.contains("Provider token bucket: limit=100000 remaining=83000"),
+            "expected remaining token limit details in message, got: {payload}"
+        );
+        assert!(
+            payload.contains("Provider rate-limit details: weekly=5%; five_hour=75%"),
+            "expected provider rate-limit details in message, got: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Live /usage probe against OpenAI Codex account quota API"]
+    async fn telegram_usage_command_live_includes_account_quota_details() {
+        if std::env::var("ZEROCLAW_LIVE_QUOTA_PROBE").ok().as_deref() != Some("1") {
+            eprintln!("Skipping live /usage probe. Set ZEROCLAW_LIVE_QUOTA_PROBE=1 to run.");
+            return;
+        }
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let sender = format!("usage_live_user_{}", uuid::Uuid::new_v4());
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("openai-codex".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("gpt-5.3-codex".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-usage-live-1".to_string(),
+                sender,
+                reply_target: "chat-usage-live".to_string(),
+                content: "/usage".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        let payload = &sent_messages[0];
+        assert!(
+            payload.contains("Account quota details: 5h remaining="),
+            "expected 5h quota details in live /usage output, got: {payload}"
+        );
+        assert!(
+            payload.contains("weekly remaining="),
+            "expected weekly quota details in live /usage output, got: {payload}"
+        );
+    }
+
+    #[tokio::test]
     async fn process_channel_message_prefers_cached_default_provider_instance() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -8072,7 +9614,10 @@ BTC is currently around $65,000 based on latest tool output."#
         let reloaded_provider: Arc<dyn Provider> = reloaded_provider_impl.clone();
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-        provider_cache_seed.insert("test-provider".to_string(), reloaded_provider);
+        provider_cache_seed.insert(
+            provider_cache_key("test-provider", None, None),
+            reloaded_provider,
+        );
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -8137,7 +9682,10 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(ModelCaptureProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+        provider_cache_seed.insert(
+            provider_cache_key("test-provider", None, None),
+            Arc::clone(&provider),
+        );
 
         let temp = tempfile::TempDir::new().expect("temp dir");
         let config_path = temp.path().join("config.toml");
@@ -8152,12 +9700,15 @@ BTC is currently around $65,000 based on latest tool output."#
                     defaults: ChannelRuntimeDefaults {
                         default_provider: "test-provider".to_string(),
                         model: "hot-reloaded-model".to_string(),
+                        reasoning_enabled: None,
+                        reasoning_effort: None,
                         temperature: 0.5,
                         api_key: None,
                         api_url: None,
                         reliability: crate::config::ReliabilityConfig::default(),
                     },
                     perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+                    show_internal_tool_logs: true,
                     last_applied_stamp: None,
                 },
             );
@@ -8247,6 +9798,7 @@ BTC is currently around $65,000 based on latest tool output."#
         cfg.autonomy.auto_approve = vec!["mock_price".to_string()];
         cfg.autonomy.always_ask = vec!["shell".to_string()];
         cfg.autonomy.non_cli_excluded_tools = vec!["browser_open".to_string()];
+        cfg.autonomy.show_internal_tool_logs = false;
         cfg.autonomy.non_cli_approval_approvers = vec!["telegram:alice".to_string()];
         cfg.autonomy.non_cli_natural_language_approval_mode =
             crate::config::NonCliNaturalLanguageApprovalMode::Direct;
@@ -8270,6 +9822,7 @@ BTC is currently around $65,000 based on latest tool output."#
             policy.non_cli_excluded_tools,
             vec!["browser_open".to_string()]
         );
+        assert!(!policy.show_internal_tool_logs);
         assert_eq!(
             policy.non_cli_approval_approvers,
             vec!["telegram:alice".to_string()]
@@ -8305,6 +9858,7 @@ BTC is currently around $65,000 based on latest tool output."#
         cfg.autonomy.non_cli_natural_language_approval_mode =
             crate::config::NonCliNaturalLanguageApprovalMode::Direct;
         cfg.autonomy.non_cli_excluded_tools = vec!["shell".to_string()];
+        cfg.autonomy.show_internal_tool_logs = false;
         cfg.security.perplexity_filter.enable_perplexity_filter = false;
         cfg.save().await.expect("save initial config");
 
@@ -8358,6 +9912,7 @@ BTC is currently around $65,000 based on latest tool output."#
             snapshot_non_cli_excluded_tools(runtime_ctx.as_ref()),
             vec!["shell".to_string()]
         );
+        assert!(!snapshot_show_internal_tool_logs(runtime_ctx.as_ref()));
         assert!(!runtime_perplexity_filter_snapshot(runtime_ctx.as_ref()).enable_perplexity_filter);
 
         cfg.autonomy.non_cli_natural_language_approval_mode =
@@ -8370,6 +9925,7 @@ BTC is currently around $65,000 based on latest tool output."#
             );
         cfg.autonomy.non_cli_excluded_tools =
             vec!["browser_open".to_string(), "mock_price".to_string()];
+        cfg.autonomy.show_internal_tool_logs = true;
         cfg.security.perplexity_filter.enable_perplexity_filter = true;
         cfg.security.perplexity_filter.perplexity_threshold = 12.5;
         cfg.save().await.expect("save updated config");
@@ -8394,6 +9950,7 @@ BTC is currently around $65,000 based on latest tool output."#
             snapshot_non_cli_excluded_tools(runtime_ctx.as_ref()),
             vec!["browser_open".to_string(), "mock_price".to_string()]
         );
+        assert!(snapshot_show_internal_tool_logs(runtime_ctx.as_ref()));
         let perplexity_cfg = runtime_perplexity_filter_snapshot(runtime_ctx.as_ref());
         assert!(perplexity_cfg.enable_perplexity_filter);
         assert_eq!(perplexity_cfg.perplexity_threshold, 12.5);
@@ -10268,6 +11825,218 @@ BTC is currently around $65,000 based on latest tool output."#;
     }
 
     #[test]
+    fn parse_runtime_command_supports_status_channels_models_and_think() {
+        assert_eq!(
+            parse_runtime_command("telegram", "/status"),
+            Some(ChannelRuntimeCommand::ShowStatus)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/channels"),
+            Some(ChannelRuntimeCommand::ShowChannels)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/usage"),
+            Some(ChannelRuntimeCommand::ShowUsage)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/sessions"),
+            Some(ChannelRuntimeCommand::ShowSessions)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/compact"),
+            Some(ChannelRuntimeCommand::CompactConversation)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/models"),
+            Some(ChannelRuntimeCommand::ShowModels)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/models gpt-5"),
+            Some(ChannelRuntimeCommand::SetModel("gpt-5".to_string()))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/think off"),
+            Some(ChannelRuntimeCommand::SetThink(Some(false)))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/think high"),
+            Some(ChannelRuntimeCommand::SetThinkEffort("high".to_string()))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/restart"),
+            Some(ChannelRuntimeCommand::RestartService)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/approve-domain example.com"),
+            Some(ChannelRuntimeCommand::ApproveDomain(
+                "example.com".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/deny-domain bad.example"),
+            Some(ChannelRuntimeCommand::DenyDomain("bad.example".to_string()))
+        );
+    }
+
+    #[test]
+    fn summarize_quota_payload_for_usage_prefers_codex_usage_windows() {
+        let payload = serde_json::json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 17,
+                    "reset_after_seconds": 1200,
+                    "reset_at": 1773000000
+                },
+                "secondary_window": {
+                    "used_percent": 95,
+                    "reset_after_seconds": 86000,
+                    "reset_at": 1773600000
+                }
+            }
+        });
+
+        let summary = summarize_quota_payload_for_usage(&payload).expect("summary");
+        assert!(summary.contains("5h remaining=83% (used=17%"));
+        assert!(summary.contains("weekly remaining=5% (used=95%"));
+    }
+
+    #[test]
+    fn telegram_usage_command_includes_remaining_limits_for_sender_snapshot() {
+        let sender_key = format!("telegram_{}", uuid::Uuid::new_v4());
+        let provider = format!("openai-codex-{}", uuid::Uuid::new_v4());
+        let model = "gpt-5.3-codex-test".to_string();
+
+        usage_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                sender_key.clone(),
+                ChannelUsageSnapshot {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    reasoning_enabled: None,
+                    reasoning_effort: Some("auto".to_string()),
+                    history_messages: 3,
+                    context_chars: 120,
+                    est_context_tokens: 30,
+                    last_response_chars: 40,
+                    est_last_response_tokens: 10,
+                    est_total_input_tokens: 300,
+                    est_total_output_tokens: 90,
+                    provider_token_limit: Some(100_000),
+                    provider_token_remaining: Some(83_000),
+                    provider_rate_limit_summary: Some("weekly=8%; five_hour=83%".to_string()),
+                    turns_completed: 2,
+                    updated_at: SystemTime::now(),
+                },
+            );
+
+        assert_eq!(
+            parse_runtime_command("telegram", "/usage"),
+            Some(ChannelRuntimeCommand::ShowUsage)
+        );
+
+        let current = ChannelRouteSelection {
+            provider,
+            model,
+            reasoning_enabled: None,
+            reasoning_effort: Some("auto".to_string()),
+        };
+        let response = build_usage_response(&sender_key, &current);
+
+        assert!(
+            response.contains("Provider token bucket: limit=100000 remaining=83000"),
+            "expected remaining token bucket data in /usage output, got: {response}"
+        );
+        assert!(
+            response.contains("Provider rate-limit details: weekly=8%; five_hour=83%"),
+            "expected provider rate-limit details in /usage output, got: {response}"
+        );
+    }
+
+    #[test]
+    fn telegram_usage_command_fallback_includes_remaining_limits_from_latest_provider_snapshot() {
+        let sender_key = format!("telegram_missing_{}", uuid::Uuid::new_v4());
+        let provider = format!("openai-codex-{}", uuid::Uuid::new_v4());
+        let model = "gpt-5.3-codex-fallback-test".to_string();
+        let seeded_sender_key = format!("telegram_seeded_{}", uuid::Uuid::new_v4());
+
+        usage_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                seeded_sender_key,
+                ChannelUsageSnapshot {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    reasoning_enabled: None,
+                    reasoning_effort: Some("auto".to_string()),
+                    history_messages: 5,
+                    context_chars: 200,
+                    est_context_tokens: 50,
+                    last_response_chars: 80,
+                    est_last_response_tokens: 20,
+                    est_total_input_tokens: 500,
+                    est_total_output_tokens: 140,
+                    provider_token_limit: Some(120_000),
+                    provider_token_remaining: Some(96_000),
+                    provider_rate_limit_summary: Some("weekly=8%; five_hour=83%".to_string()),
+                    turns_completed: 4,
+                    updated_at: SystemTime::now(),
+                },
+            );
+
+        assert_eq!(
+            parse_runtime_command("telegram", "/usage"),
+            Some(ChannelRuntimeCommand::ShowUsage)
+        );
+
+        let current = ChannelRouteSelection {
+            provider,
+            model,
+            reasoning_enabled: None,
+            reasoning_effort: Some("auto".to_string()),
+        };
+        let response = build_usage_response(&sender_key, &current);
+
+        assert!(
+            response.contains("No usage recorded yet for this sender."),
+            "expected sender-missing notice in /usage output, got: {response}"
+        );
+        assert!(
+            response.contains("Latest provider snapshot in runtime:"),
+            "expected provider-level fallback in /usage output, got: {response}"
+        );
+        assert!(
+            response.contains("Provider token bucket: limit=120000 remaining=96000"),
+            "expected remaining limits in provider fallback /usage output, got: {response}"
+        );
+    }
+
+    #[test]
+    fn normalize_reasoning_effort_respects_model_levels() {
+        assert_eq!(
+            normalize_reasoning_effort_for_model("gpt-5-codex", "minimal"),
+            Some("low".to_string())
+        );
+        assert_eq!(
+            normalize_reasoning_effort_for_model("gpt-5.1-codex-mini", "low"),
+            Some("medium".to_string())
+        );
+        assert_eq!(
+            normalize_reasoning_effort_for_model("gpt-5.3-codex", "xhigh"),
+            Some("xhigh".to_string())
+        );
+    }
+
+    #[test]
+    fn abort_runtime_command_detection_is_channel_scoped() {
+        assert!(is_abort_runtime_command("telegram", "/abort"));
+        assert!(!is_abort_runtime_command("test-channel", "/abort"));
+        assert!(!is_abort_runtime_command("telegram", "abort"));
+    }
+
+    #[test]
     fn normalize_merges_consecutive_user_turns() {
         let turns = vec![ChatMessage::user("hello"), ChatMessage::user("world")];
         let result = normalize_cached_channel_turns(turns);
@@ -10487,6 +12256,147 @@ BTC is currently around $65,000 based on latest tool output."#;
         assert!(
             turns.iter().all(|turn| !turn.content.contains("[IMAGE:")),
             "failed vision turn must not persist image marker content"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_multimodal_limit_can_continue_with_confirmation() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(VisionCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig {
+                max_images: 1,
+                ..crate::config::MultimodalConfig::default()
+            },
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        let sender = "zeroclaw_limit_user";
+        let reply_target = "chat-limit";
+        let first = traits::ChannelMessage {
+            id: "msg-limit-1".to_string(),
+            sender: sender.to_string(),
+            reply_target: reply_target.to_string(),
+            content: "Compare these.\n\n[IMAGE:data:image/png;base64,AA==]\n[IMAGE:data:image/png;base64,AQ==]"
+                .to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+        };
+
+        process_channel_message(
+            Arc::clone(&runtime_ctx),
+            first.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let pending_key = interruption_scope_key(&first);
+        assert!(
+            pending_limit_store()
+                .lock()
+                .await
+                .contains_key(&pending_key),
+            "pending continuation should be stored"
+        );
+
+        {
+            let sent = channel_impl.sent_messages.lock().await;
+            assert_eq!(sent.len(), 1);
+            assert!(sent[0].contains("Multimodal image limit reached"));
+            assert!(sent[0].contains("/continue"));
+        }
+
+        let history_key = conversation_history_key(&first);
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !histories.contains_key(&history_key),
+            "failed turn should be rolled back from conversation history"
+        );
+        drop(histories);
+
+        let continue_msg = traits::ChannelMessage {
+            id: "msg-limit-2".to_string(),
+            sender: sender.to_string(),
+            reply_target: reply_target.to_string(),
+            content: "/continue".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 2,
+            thread_ts: None,
+        };
+
+        process_channel_message(
+            Arc::clone(&runtime_ctx),
+            continue_msg,
+            CancellationToken::new(),
+        )
+        .await;
+
+        {
+            let sent = channel_impl.sent_messages.lock().await;
+            assert_eq!(sent.len(), 3, "prompt + continuation note + final reply");
+            assert!(sent[1].contains("Continuing previous request"));
+            assert!(sent[2].contains("vision-ok"));
+        }
+
+        assert!(
+            !pending_limit_store()
+                .lock()
+                .await
+                .contains_key(&pending_key),
+            "pending continuation should be consumed on /continue"
+        );
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            calls.len(),
+            1,
+            "provider should be called only after /continue"
+        );
+        let last_user = calls[0]
+            .iter()
+            .rev()
+            .find_map(|(role, content)| (role == "user").then_some(content.as_str()))
+            .expect("user message should be present in provider call");
+        assert_eq!(
+            crate::multimodal::parse_image_markers(last_user).1.len(),
+            1,
+            "continued request must cap latest message to one image"
         );
     }
 }

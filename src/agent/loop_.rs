@@ -4,10 +4,11 @@ use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
 use crate::providers::{
-    self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
+    self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, TokenUsage, ToolCall,
 };
 use crate::runtime;
 use crate::security::SecurityPolicy;
+use crate::security::{extract_domain_approval_host, DOMAIN_APPROVAL_REQUIRED_PREFIX};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
@@ -122,6 +123,12 @@ pub(crate) const DRAFT_CLEAR_SENTINEL: &str = "\x00CLEAR\x00";
 /// Channel layers can suppress these messages by default and only expose them
 /// when the user explicitly asks for command/tool execution details.
 pub(crate) const DRAFT_PROGRESS_SENTINEL: &str = "\x00PROGRESS\x00";
+/// Marker prefix for a tagged tool-start progress line (enables in-place update on completion).
+/// Full payload after `DRAFT_PROGRESS_SENTINEL`: `TOOL_PROGRESS_START_MARKER{idx}\x00{line}\n`
+pub(crate) const TOOL_PROGRESS_START_MARKER: &str = "\x00TS:";
+/// Marker prefix for a tagged tool-done progress line (replaces the matching start line).
+/// Full payload after `DRAFT_PROGRESS_SENTINEL`: `TOOL_PROGRESS_DONE_MARKER{idx}\x00{line}\n`
+pub(crate) const TOOL_PROGRESS_DONE_MARKER: &str = "\x00TD:";
 
 tokio::task_local! {
     static TOOL_LOOP_REPLY_TARGET: Option<String>;
@@ -425,6 +432,12 @@ pub(crate) fn is_tool_iteration_limit_error(err: &anyhow::Error) -> bool {
     })
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ToolLoopResult {
+    pub text: String,
+    pub usage: Option<TokenUsage>,
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
@@ -460,6 +473,7 @@ pub(crate) async fn agent_turn(
         &[],
     )
     .await
+    .map(|result| result.text)
 }
 
 /// Run the tool loop with channel reply_target context, used by channel runtimes
@@ -507,6 +521,7 @@ pub(crate) async fn run_tool_call_loop_with_reply_target(
             ),
         )
         .await
+        .map(|r| r.text)
 }
 
 /// Run the tool loop with optional non-CLI approval context scoped to this task.
@@ -529,7 +544,7 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
-) -> Result<String> {
+) -> Result<ToolLoopResult> {
     let reply_target = non_cli_approval_context
         .as_ref()
         .map(|ctx| ctx.reply_target.clone());
@@ -594,7 +609,7 @@ pub(crate) async fn run_tool_call_loop(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
-) -> Result<String> {
+) -> Result<ToolLoopResult> {
     let non_cli_approval_context = TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT
         .try_with(Clone::clone)
         .ok()
@@ -608,7 +623,6 @@ pub(crate) async fn run_tool_call_loop(
                 .as_ref()
                 .map(|ctx| ctx.reply_target.clone())
         });
-
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
@@ -637,6 +651,13 @@ pub(crate) async fn run_tool_call_loop(
             serde_json::json!({}),
         );
     }
+    let mut total_input_tokens = 0_u64;
+    let mut total_output_tokens = 0_u64;
+    let mut has_input_usage = false;
+    let mut has_output_usage = false;
+    let mut latest_token_limit: Option<u64> = None;
+    let mut latest_token_remaining: Option<u64> = None;
+    let mut latest_rate_limit_summary: Option<String> = None;
 
     for iteration in 0..max_iterations {
         if cancellation_token
@@ -726,6 +747,26 @@ pub(crate) async fn run_tool_call_loop(
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
             match chat_result {
                 Ok(resp) => {
+                    if let Some(usage) = resp.usage.as_ref() {
+                        if let Some(input_tokens) = usage.input_tokens {
+                            total_input_tokens = total_input_tokens.saturating_add(input_tokens);
+                            has_input_usage = true;
+                        }
+                        if let Some(output_tokens) = usage.output_tokens {
+                            total_output_tokens = total_output_tokens.saturating_add(output_tokens);
+                            has_output_usage = true;
+                        }
+                        if usage.token_limit.is_some() {
+                            latest_token_limit = usage.token_limit;
+                        }
+                        if usage.token_remaining.is_some() {
+                            latest_token_remaining = usage.token_remaining;
+                        }
+                        if usage.rate_limit_summary.is_some() {
+                            latest_rate_limit_summary = usage.rate_limit_summary.clone();
+                        }
+                    }
+
                     let (resp_input_tokens, resp_output_tokens) = resp
                         .usage
                         .as_ref()
@@ -893,8 +934,8 @@ pub(crate) async fn run_tool_call_loop(
             // If a streaming sender is provided, relay the text in small chunks
             // so the channel can progressively update the draft message.
             if let Some(ref tx) = on_delta {
-                // Clear accumulated progress lines before streaming the final answer.
-                let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                // Keep accumulated progress lines visible; the final answer streams
+                // directly below them so the user can see which tools ran.
                 // Split on whitespace boundaries, accumulating chunks of at least
                 // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
                 let mut chunk = String::new();
@@ -917,7 +958,26 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(display_text);
+            let usage = if has_input_usage
+                || has_output_usage
+                || latest_token_limit.is_some()
+                || latest_token_remaining.is_some()
+                || latest_rate_limit_summary.is_some()
+            {
+                Some(TokenUsage {
+                    input_tokens: has_input_usage.then_some(total_input_tokens),
+                    output_tokens: has_output_usage.then_some(total_output_tokens),
+                    token_limit: latest_token_limit,
+                    token_remaining: latest_token_remaining,
+                    rate_limit_summary: latest_rate_limit_summary.clone(),
+                })
+            } else {
+                None
+            };
+            return Ok(ToolLoopResult {
+                text: display_text,
+                usage,
+            });
         }
 
         // Print any text the LLM produced alongside tool calls (unless silent)
@@ -1153,14 +1213,16 @@ pub(crate) async fn run_tool_call_loop(
             // ── Progress: tool start ────────────────────────────
             if let Some(ref tx) = on_delta {
                 let hint = truncate_tool_args_for_progress(&tool_name, &tool_args, 60);
-                let progress = if hint.is_empty() {
+                let line = if hint.is_empty() {
                     format!("\u{23f3} {}\n", tool_name)
                 } else {
                     format!("\u{23f3} {}: {hint}\n", tool_name)
                 };
                 tracing::debug!(tool = %tool_name, "Sending progress start to draft");
                 let _ = tx
-                    .send(format!("{DRAFT_PROGRESS_SENTINEL}{progress}"))
+                    .send(format!(
+                        "{DRAFT_PROGRESS_SENTINEL}{TOOL_PROGRESS_START_MARKER}{idx}\x00{line}"
+                    ))
                     .await;
             }
 
@@ -1231,16 +1293,35 @@ pub(crate) async fn run_tool_call_loop(
                 } else {
                     "\u{274c}"
                 };
+                let hint = truncate_tool_args_for_progress(&call.name, &call.arguments, 60);
+                let line = if hint.is_empty() {
+                    format!("{icon} {} ({secs}s)\n", call.name)
+                } else {
+                    format!("{icon} {}: {hint} ({secs}s)\n", call.name)
+                };
                 tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
                 let _ = tx
                     .send(format!(
-                        "{DRAFT_PROGRESS_SENTINEL}{icon} {} ({secs}s)\n",
-                        call.name
+                        "{DRAFT_PROGRESS_SENTINEL}{TOOL_PROGRESS_DONE_MARKER}{idx}\x00{line}"
                     ))
                     .await;
             }
 
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
+        }
+
+        for entry in &ordered_results {
+            let Some((_, _, outcome)) = entry else {
+                continue;
+            };
+            let Some(reason) = outcome.error_reason.as_deref() else {
+                continue;
+            };
+            if extract_domain_approval_host(reason).is_some()
+                || reason.contains(DOMAIN_APPROVAL_REQUIRED_PREFIX)
+            {
+                anyhow::bail!("{reason}");
+            }
         }
 
         for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
@@ -1507,6 +1588,7 @@ pub async fn run(
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_level: config.effective_provider_reasoning_level(),
+        reasoning_effort: None,
         custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
         max_tokens_override: None,
         model_support_vision: config.model_support_vision,
@@ -1746,8 +1828,8 @@ pub async fn run(
             &[],
         )
         .await?;
-        final_output = response.clone();
-        println!("{response}");
+        final_output = response.text.clone();
+        println!("{}", response.text);
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
@@ -1883,10 +1965,13 @@ pub async fn run(
                     continue;
                 }
             };
-            final_output = response.clone();
+            final_output = response.text.clone();
             if let Err(e) = crate::channels::Channel::send(
                 &cli,
-                &crate::channels::traits::SendMessage::new(format!("\n{response}\n"), "user"),
+                &crate::channels::traits::SendMessage::new(
+                    format!("\n{}\n", response.text),
+                    "user",
+                ),
             )
             .await
             {
@@ -1982,6 +2067,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_level: config.effective_provider_reasoning_level(),
+        reasoning_effort: None,
         custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
         max_tokens_override: None,
         model_support_vision: config.model_support_vision,
@@ -2578,7 +2664,7 @@ mod tests {
         .await
         .expect("valid multimodal payload should pass");
 
-        assert_eq!(result, "vision-ok");
+        assert_eq!(result.text, "vision-ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -2704,7 +2790,7 @@ mod tests {
         .await
         .expect("parallel execution should complete");
 
-        assert_eq!(result, "done");
+        assert_eq!(result.text, "done");
         assert!(
             max_active.load(Ordering::SeqCst) >= 1,
             "tools should execute successfully"
@@ -3033,7 +3119,7 @@ mod tests {
         .await
         .expect("loop should finish after deduplicating repeated calls");
 
-        assert_eq!(result, "done");
+        assert_eq!(result.text, "done");
         assert_eq!(
             invocations.load(Ordering::SeqCst),
             1,
@@ -3089,7 +3175,7 @@ mod tests {
         .await
         .expect("native fallback id flow should complete");
 
-        assert_eq!(result, "done");
+        assert_eq!(result.text, "done");
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
         assert!(
             history.iter().any(|msg| {

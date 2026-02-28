@@ -17,7 +17,7 @@ const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 /// Reserve space for continuation markers added by send_text_chunks:
 /// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 30 extra chars
 const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
-const TELEGRAM_ACK_REACTIONS: &[&str] = &["⚡️", "👌", "👀", "🔥", "👍"];
+const TELEGRAM_ACK_REACTIONS: &[&str] = &["👀"];
 
 /// Metadata for an incoming document or photo attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +47,21 @@ struct VoiceMetadata {
 const TELEGRAM_BIND_COMMAND: &str = "/bind";
 const TELEGRAM_APPROVAL_CALLBACK_APPROVE_PREFIX: &str = "zcapr:yes:";
 const TELEGRAM_APPROVAL_CALLBACK_DENY_PREFIX: &str = "zcapr:no:";
+
+const TELEGRAM_RUNTIME_COMMANDS: &[(&str, &str)] = &[
+    ("status", "Show ZeroClaw runtime status"),
+    ("channels", "Show active channels"),
+    ("usage", "Show current session usage snapshot"),
+    ("sessions", "Show active chat sessions"),
+    ("compact", "Compact conversation context"),
+    ("providers", "List providers or switch provider"),
+    ("models", "List models or switch model"),
+    ("think", "Set reasoning mode/effort"),
+    ("approve-domain", "Approve domain for browser/http"),
+    ("deny-domain", "Block domain for browser/http"),
+    ("abort", "Abort current execution"),
+    ("restart", "Restart managed ZeroClaw service"),
+];
 
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
@@ -463,6 +478,7 @@ pub struct TelegramChannel {
     /// Override for local Bot API servers or testing.
     api_base: String,
     transcription: Option<crate::config::TranscriptionConfig>,
+    transcription_api_key: Option<String>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
 }
@@ -495,6 +511,7 @@ impl TelegramChannel {
             bot_username: Mutex::new(None),
             api_base: "https://api.telegram.org".to_string(),
             transcription: None,
+            transcription_api_key: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
         }
@@ -536,6 +553,14 @@ impl TelegramChannel {
         if config.enabled {
             self.transcription = Some(config);
         }
+        self
+    }
+
+    /// Configure optional API key fallback for voice transcription.
+    pub fn with_transcription_api_key(mut self, api_key: Option<String>) -> Self {
+        self.transcription_api_key = api_key
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty());
         self
     }
 
@@ -817,6 +842,62 @@ impl TelegramChannel {
 
     fn api_url(&self, method: &str) -> String {
         format!("{}/bot{}/{method}", self.api_base, self.bot_token)
+    }
+
+    fn build_my_commands_payload(&self) -> serde_json::Value {
+        let mut commands: Vec<serde_json::Value> = TELEGRAM_RUNTIME_COMMANDS
+            .iter()
+            .map(|(command, description)| {
+                serde_json::json!({
+                    "command": command,
+                    "description": description,
+                })
+            })
+            .collect();
+
+        if self.pairing_code_active() {
+            commands.push(serde_json::json!({
+                "command": "bind",
+                "description": "Bind account with one-time code",
+            }));
+        }
+
+        serde_json::json!({ "commands": commands })
+    }
+
+    async fn sync_my_commands(&self) -> anyhow::Result<()> {
+        let payload = self.build_my_commands_payload();
+        let response = self
+            .http_client()
+            .post(self.api_url("setMyCommands"))
+            .json(&payload)
+            .send()
+            .await
+            .context("Failed to call Telegram setMyCommands")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Telegram setMyCommands failed ({status}): {body}");
+        }
+
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .context("Failed to parse Telegram setMyCommands response")?;
+        let ok = body
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !ok {
+            let description = body
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown Telegram API error");
+            anyhow::bail!("Telegram setMyCommands API rejected request: {description}");
+        }
+
+        Ok(())
     }
 
     async fn fetch_bot_username(&self) -> anyhow::Result<String> {
@@ -1598,14 +1679,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
-        let text =
-            match super::transcription::transcribe_audio(audio_data, &file_name, config).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!("Voice transcription failed: {e}");
-                    return None;
-                }
-            };
+        let text = match super::transcription::transcribe_audio(
+            audio_data,
+            &file_name,
+            config,
+            self.transcription_api_key.as_deref(),
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Voice transcription failed: {e}");
+                return None;
+            }
+        };
 
         if text.trim().is_empty() {
             tracing::info!("Voice transcription returned empty text, skipping");
@@ -3007,6 +3094,12 @@ impl Channel for TelegramChannel {
             let _ = self.get_bot_username().await;
         }
 
+        if let Err(err) = self.sync_my_commands().await {
+            tracing::warn!("Telegram command sync failed: {err}");
+        } else {
+            tracing::info!("Telegram command menu synced via setMyCommands");
+        }
+
         tracing::info!("Telegram channel listening for messages...");
 
         // Startup probe: claim the getUpdates slot before entering the long-poll loop.
@@ -3439,6 +3532,46 @@ mod tests {
             ch.api_url("sendMessage"),
             "https://tapi.bale.ai/bot123:ABC/sendMessage"
         );
+    }
+
+    #[test]
+    fn telegram_set_my_commands_payload_includes_runtime_commands() {
+        let ch = TelegramChannel::new("123:ABC".into(), vec!["*".into()], false);
+        let payload = ch.build_my_commands_payload();
+        let commands = payload
+            .get("commands")
+            .and_then(serde_json::Value::as_array)
+            .expect("commands must be an array");
+
+        let names: Vec<&str> = commands
+            .iter()
+            .filter_map(|item| item.get("command").and_then(serde_json::Value::as_str))
+            .collect();
+
+        assert!(names.contains(&"status"));
+        assert!(names.contains(&"channels"));
+        assert!(names.contains(&"usage"));
+        assert!(names.contains(&"compact"));
+        assert!(names.contains(&"models"));
+        assert!(names.contains(&"think"));
+        assert!(names.contains(&"abort"));
+        assert!(names.contains(&"restart"));
+        assert!(!names.contains(&"bind"));
+    }
+
+    #[test]
+    fn telegram_set_my_commands_payload_includes_bind_when_pairing_active() {
+        let ch = TelegramChannel::new("123:ABC".into(), vec![], false);
+        let payload = ch.build_my_commands_payload();
+        let commands = payload
+            .get("commands")
+            .and_then(serde_json::Value::as_array)
+            .expect("commands must be an array");
+        let names: Vec<&str> = commands
+            .iter()
+            .filter_map(|item| item.get("command").and_then(serde_json::Value::as_str))
+            .collect();
+        assert!(names.contains(&"bind"));
     }
 
     #[test]
@@ -5165,10 +5298,14 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let transcript: String =
-            crate::channels::transcription::transcribe_audio(audio_data, "hello.mp3", &config)
-                .await
-                .expect("transcribe_audio should succeed with valid GROQ_API_KEY");
+        let transcript: String = crate::channels::transcription::transcribe_audio(
+            audio_data,
+            "hello.mp3",
+            &config,
+            None,
+        )
+        .await
+        .expect("transcribe_audio should succeed with valid GROQ_API_KEY");
 
         // 3. Verify Whisper actually recognized "hello"
         assert!(

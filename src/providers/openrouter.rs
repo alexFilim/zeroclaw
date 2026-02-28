@@ -481,11 +481,27 @@ impl Provider for OpenRouterProvider {
             return Err(super::api_error("OpenRouter", response).await);
         }
 
+        let (token_limit, token_remaining) =
+            super::token_rate_limit_from_headers(response.headers());
         let native_response: NativeChatResponse = response.json().await?;
-        let usage = native_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-        });
+        let usage = native_response
+            .usage
+            .map(|u| TokenUsage {
+                input_tokens: u.prompt_tokens,
+                output_tokens: u.completion_tokens,
+                token_limit,
+                token_remaining,
+                rate_limit_summary: None,
+            })
+            .or_else(|| {
+                (token_limit.is_some() || token_remaining.is_some()).then_some(TokenUsage {
+                    input_tokens: None,
+                    output_tokens: None,
+                    token_limit,
+                    token_remaining,
+                    rate_limit_summary: None,
+                })
+            });
         let message = native_response
             .choices
             .into_iter()
@@ -576,11 +592,27 @@ impl Provider for OpenRouterProvider {
             return Err(super::api_error("OpenRouter", response).await);
         }
 
+        let (token_limit, token_remaining) =
+            super::token_rate_limit_from_headers(response.headers());
         let native_response: NativeChatResponse = response.json().await?;
-        let usage = native_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-        });
+        let usage = native_response
+            .usage
+            .map(|u| TokenUsage {
+                input_tokens: u.prompt_tokens,
+                output_tokens: u.completion_tokens,
+                token_limit,
+                token_remaining,
+                rate_limit_summary: None,
+            })
+            .or_else(|| {
+                (token_limit.is_some() || token_remaining.is_some()).then_some(TokenUsage {
+                    input_tokens: None,
+                    output_tokens: None,
+                    token_limit,
+                    token_remaining,
+                    rate_limit_summary: None,
+                })
+            });
         let message = native_response
             .choices
             .into_iter()

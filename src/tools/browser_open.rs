@@ -1,9 +1,12 @@
 use super::traits::{Tool, ToolResult};
 use super::url_validation::{
-    normalize_allowed_domains, validate_url, DomainPolicy, UrlSchemePolicy,
+    extract_host, host_matches_allowlist, normalize_allowed_domains, validate_url, DomainPolicy,
+    UrlSchemePolicy,
 };
 use crate::config::UrlAccessConfig;
-use crate::security::SecurityPolicy;
+use crate::security::{
+    runtime_domain_policy, AutonomyLevel, SecurityPolicy, DOMAIN_APPROVAL_REQUIRED_PREFIX,
+};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -29,8 +32,33 @@ impl BrowserOpenTool {
     }
 
     fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
-        validate_url(
-            raw_url,
+        let url = raw_url.trim();
+        let host = extract_host(url, UrlSchemePolicy::HttpsOnly, "browser_open")?;
+
+        if let Some(policy) = runtime_domain_policy() {
+            if policy.is_denied(&host) {
+                anyhow::bail!("Host '{host}' is blocked by runtime domain denylist");
+            }
+            if policy.is_allowed(&host) {
+                let host_allowlist = vec![host.clone()];
+                return validate_url(
+                    url,
+                    &DomainPolicy {
+                        allowed_domains: &host_allowlist,
+                        blocked_domains: &[],
+                        allowed_field_name: "browser.allowed_domains",
+                        blocked_field_name: None,
+                        empty_allowed_message: "Browser tool is enabled but no allowed_domains are configured. Add [browser].allowed_domains in config.toml",
+                        scheme_policy: UrlSchemePolicy::HttpsOnly,
+                        ipv6_error_context: "browser_open",
+                        url_access: Some(&self.url_access),
+                    },
+                );
+            }
+        }
+
+        match validate_url(
+            url,
             &DomainPolicy {
                 allowed_domains: &self.allowed_domains,
                 blocked_domains: &[],
@@ -41,7 +69,17 @@ impl BrowserOpenTool {
                 ipv6_error_context: "browser_open",
                 url_access: Some(&self.url_access),
             },
-        )
+        ) {
+            Ok(validated) => Ok(validated),
+            Err(err)
+                if self.security.autonomy == AutonomyLevel::Supervised
+                    && !self.allowed_domains.is_empty()
+                    && !host_matches_allowlist(&host, &self.allowed_domains) =>
+            {
+                anyhow::bail!("{DOMAIN_APPROVAL_REQUIRED_PREFIX}{host}");
+            }
+            Err(err) => Err(err),
+        }
     }
 }
 

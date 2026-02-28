@@ -54,6 +54,12 @@ pub struct ToolCall {
 pub struct TokenUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Provider-reported token bucket limit (if exposed via API response metadata).
+    pub token_limit: Option<u64>,
+    /// Provider-reported remaining tokens in current bucket/window.
+    pub token_remaining: Option<u64>,
+    /// Provider-specific rate-limit details when numeric token buckets are not available.
+    pub rate_limit_summary: Option<String>,
 }
 
 /// An LLM response that may contain text, tool calls, or both.
@@ -562,6 +568,9 @@ mod tests {
         let usage = TokenUsage::default();
         assert!(usage.input_tokens.is_none());
         assert!(usage.output_tokens.is_none());
+        assert!(usage.token_limit.is_none());
+        assert!(usage.token_remaining.is_none());
+        assert!(usage.rate_limit_summary.is_none());
     }
 
     #[test]
@@ -572,6 +581,9 @@ mod tests {
             usage: Some(TokenUsage {
                 input_tokens: Some(100),
                 output_tokens: Some(50),
+                token_limit: None,
+                token_remaining: None,
+                rate_limit_summary: None,
             }),
             reasoning_content: None,
         };

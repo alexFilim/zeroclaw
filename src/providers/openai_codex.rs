@@ -1,7 +1,9 @@
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::auth::AuthService;
 use crate::multimodal;
-use crate::providers::traits::{ChatMessage, Provider, ProviderCapabilities};
+use crate::providers::traits::{
+    ChatMessage, ChatRequest, ChatResponse, Provider, ProviderCapabilities, TokenUsage,
+};
 use crate::providers::ProviderRuntimeOptions;
 use async_trait::async_trait;
 use reqwest::Client;
@@ -12,6 +14,13 @@ use std::path::PathBuf;
 const DEFAULT_CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const CODEX_RESPONSES_URL_ENV: &str = "ZEROCLAW_CODEX_RESPONSES_URL";
 const CODEX_BASE_URL_ENV: &str = "ZEROCLAW_CODEX_BASE_URL";
+const CODEX_QUOTA_ENDPOINTS: [&str; 5] = [
+    "https://chatgpt.com/backend-api/codex/usage",
+    "https://chatgpt.com/backend-api/codex/rate_limits",
+    "https://chatgpt.com/backend-api/codex/limits",
+    "https://chatgpt.com/backend-api/usage_limits",
+    "https://chatgpt.com/backend-api/limits",
+];
 const DEFAULT_CODEX_INSTRUCTIONS: &str =
     "You are ZeroClaw, a concise and helpful coding assistant.";
 
@@ -72,6 +81,11 @@ struct ResponsesResponse {
     output: Vec<ResponsesOutput>,
     #[serde(default)]
     output_text: Option<String>,
+}
+
+struct CodexResponseMetadata {
+    text: String,
+    rate_limit_summary: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,39 +235,31 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<ResponsesInpu
             "system" => system_parts.push(&msg.content),
             "user" => {
                 let (cleaned_text, image_refs) = multimodal::parse_image_markers(&msg.content);
-
-                let mut content_items = Vec::new();
-
-                // Add text if present
+                let mut content = Vec::new();
                 if !cleaned_text.trim().is_empty() {
-                    content_items.push(ResponsesInputContent {
+                    content.push(ResponsesInputContent {
                         kind: "input_text".to_string(),
                         text: Some(cleaned_text),
                         image_url: None,
                     });
                 }
-
-                // Add images
                 for image_ref in image_refs {
-                    content_items.push(ResponsesInputContent {
+                    content.push(ResponsesInputContent {
                         kind: "input_image".to_string(),
                         text: None,
                         image_url: Some(image_ref),
                     });
                 }
-
-                // If no content at all, add empty text
-                if content_items.is_empty() {
-                    content_items.push(ResponsesInputContent {
+                if content.is_empty() {
+                    content.push(ResponsesInputContent {
                         kind: "input_text".to_string(),
-                        text: Some(String::new()),
+                        text: Some(msg.content.clone()),
                         image_url: None,
                     });
                 }
-
                 input.push(ResponsesInput {
                     role: "user".to_string(),
-                    content: content_items,
+                    content,
                 });
             }
             "assistant" => {
@@ -469,6 +475,220 @@ fn parse_sse_text(body: &str) -> anyhow::Result<Option<String>> {
     Ok(fallback_text)
 }
 
+fn is_rate_limit_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("limit")
+        || key.contains("quota")
+        || key.contains("remaining")
+        || key.contains("usage")
+        || key.contains("weekly")
+        || key.contains("5h")
+        || key.contains("hour")
+        || key.contains("percent")
+        || key.contains("pct")
+}
+
+fn is_quota_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("weekly")
+        || key.contains("week")
+        || key.contains("5h")
+        || key.contains("five")
+        || key.contains("hour")
+        || key.contains("remaining")
+        || key.contains("limit")
+        || key.contains("quota")
+        || key.contains("percent")
+        || key.contains("reset")
+}
+
+fn collect_rate_limit_pairs(value: &Value, path: &str, out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map {
+                let child_path = if path.is_empty() {
+                    k.to_string()
+                } else {
+                    format!("{path}.{k}")
+                };
+                if is_rate_limit_key(k) {
+                    match v {
+                        Value::String(s) if !s.trim().is_empty() => {
+                            out.push(format!("{child_path}={}", s.trim()));
+                        }
+                        Value::Number(n) => out.push(format!("{child_path}={n}")),
+                        Value::Bool(b) => out.push(format!("{child_path}={b}")),
+                        _ => {}
+                    }
+                }
+                collect_rate_limit_pairs(v, &child_path, out);
+            }
+        }
+        Value::Array(arr) => {
+            for (idx, item) in arr.iter().enumerate() {
+                let child_path = if path.is_empty() {
+                    format!("[{idx}]")
+                } else {
+                    format!("{path}[{idx}]")
+                };
+                collect_rate_limit_pairs(item, &child_path, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_sse_rate_limit_summary(body: &str) -> Option<String> {
+    let mut pairs = Vec::new();
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = data.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<Value>(payload) {
+            collect_rate_limit_pairs(&event, "", &mut pairs);
+        }
+    }
+    if pairs.is_empty() {
+        None
+    } else {
+        pairs.sort();
+        pairs.dedup();
+        Some(pairs.join("; "))
+    }
+}
+
+fn collect_quota_pairs(value: &Value, path: &str, out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map {
+                let child_path = if path.is_empty() {
+                    k.to_string()
+                } else {
+                    format!("{path}.{k}")
+                };
+                if is_quota_key(k) || is_quota_key(&child_path) {
+                    match v {
+                        Value::String(s) if !s.trim().is_empty() => {
+                            out.push(format!("{child_path}={}", s.trim()));
+                        }
+                        Value::Number(n) => out.push(format!("{child_path}={n}")),
+                        Value::Bool(b) => out.push(format!("{child_path}={b}")),
+                        _ => {}
+                    }
+                }
+                collect_quota_pairs(v, &child_path, out);
+            }
+        }
+        Value::Array(arr) => {
+            for (idx, item) in arr.iter().enumerate() {
+                let child_path = if path.is_empty() {
+                    format!("[{idx}]")
+                } else {
+                    format!("{path}[{idx}]")
+                };
+                collect_quota_pairs(item, &child_path, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn summarize_quota_payload(value: &Value) -> Option<String> {
+    if let Some(summary) = summarize_codex_usage_payload(value) {
+        return Some(summary);
+    }
+
+    let mut pairs = Vec::new();
+    collect_quota_pairs(value, "", &mut pairs);
+    if pairs.is_empty() {
+        None
+    } else {
+        pairs.sort();
+        pairs.dedup();
+        Some(pairs.join("; "))
+    }
+}
+
+fn summarize_codex_usage_window(label: &str, window: &Value) -> Option<String> {
+    let used_percent = window.get("used_percent").and_then(Value::as_u64)?;
+    let remaining_percent = 100_u64.saturating_sub(used_percent.min(100));
+    let reset_after = window
+        .get("reset_after_seconds")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let reset_at = window
+        .get("reset_at")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let reset_after_human = humanize_reset_after_seconds(reset_after);
+    let reset_at_human = humanize_unix_timestamp_utc(reset_at);
+    Some(format!(
+        "{label} remaining={remaining_percent}% (used={used_percent}%, reset in {reset_after_human}, reset at {reset_at_human})"
+    ))
+}
+
+fn humanize_reset_after_seconds(seconds: i64) -> String {
+    if seconds <= 0 {
+        return "now".to_string();
+    }
+    let mut remaining = seconds;
+    let days = remaining / 86_400;
+    remaining %= 86_400;
+    let hours = remaining / 3_600;
+    remaining %= 3_600;
+    let minutes = remaining / 60;
+    let secs = remaining % 60;
+
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{days}d"));
+    }
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if minutes > 0 {
+        parts.push(format!("{minutes}m"));
+    }
+    if secs > 0 && parts.is_empty() {
+        parts.push(format!("{secs}s"));
+    }
+    if parts.is_empty() {
+        "now".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn humanize_unix_timestamp_utc(timestamp: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| timestamp.to_string())
+}
+
+fn summarize_codex_usage_payload(value: &Value) -> Option<String> {
+    let rate_limit = value.get("rate_limit")?;
+    let mut parts = Vec::new();
+    if let Some(window) = rate_limit.get("primary_window") {
+        if let Some(summary) = summarize_codex_usage_window("5h", window) {
+            parts.push(summary);
+        }
+    }
+    if let Some(window) = rate_limit.get("secondary_window") {
+        if let Some(summary) = summarize_codex_usage_window("weekly", window) {
+            parts.push(summary);
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
+}
+
 fn extract_stream_error_message(event: &Value) -> Option<String> {
     let event_type = event.get("type").and_then(Value::as_str);
 
@@ -525,13 +745,116 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<St
     extract_responses_text(&parsed).ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex"))
 }
 
+async fn decode_responses_body_with_metadata(
+    response: reqwest::Response,
+) -> anyhow::Result<CodexResponseMetadata> {
+    let body = response.text().await?;
+    let sse_rate_limit_summary = parse_sse_rate_limit_summary(&body);
+
+    let text = if let Some(text) = parse_sse_text(&body)? {
+        text
+    } else {
+        let body_trimmed = body.trim_start();
+        let looks_like_sse =
+            body_trimmed.starts_with("event:") || body_trimmed.starts_with("data:");
+        if looks_like_sse {
+            return Err(anyhow::anyhow!(
+                "No response from OpenAI Codex stream payload: {}",
+                super::sanitize_api_error(&body)
+            ));
+        }
+
+        let parsed: ResponsesResponse = serde_json::from_str(&body).map_err(|err| {
+            anyhow::anyhow!(
+                "OpenAI Codex JSON parse failed: {err}. Payload: {}",
+                super::sanitize_api_error(&body)
+            )
+        })?;
+        extract_responses_text(&parsed)
+            .ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex"))?
+    };
+
+    Ok(CodexResponseMetadata {
+        text,
+        rate_limit_summary: sse_rate_limit_summary,
+    })
+}
+
+fn codex_rate_limit_summary_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let mut pairs = Vec::new();
+    for (name, value) in headers {
+        let key = name.as_str().to_ascii_lowercase();
+        let include = key.contains("ratelimit")
+            || key.contains("rate-limit")
+            || key.contains("weekly")
+            || key.contains("5h")
+            || key.contains("5-hour")
+            || key.contains("limit")
+            || key.contains("quota")
+            || key.contains("usage");
+        if !include {
+            continue;
+        }
+        if let Ok(text) = value.to_str() {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                pairs.push(format!("{key}={trimmed}"));
+            }
+        }
+    }
+    if pairs.is_empty() {
+        None
+    } else {
+        Some(pairs.join("; "))
+    }
+}
+
 impl OpenAiCodexProvider {
+    async fn fetch_codex_quota_summary(
+        &self,
+        access_token: &str,
+        account_id: &str,
+    ) -> Option<String> {
+        for endpoint in CODEX_QUOTA_ENDPOINTS {
+            let response = match self
+                .client
+                .get(endpoint)
+                .header("Authorization", format!("Bearer {access_token}"))
+                .header("chatgpt-account-id", account_id)
+                .header("originator", "pi")
+                .header("accept", "application/json")
+                .send()
+                .await
+            {
+                Ok(resp) => resp,
+                Err(_) => continue,
+            };
+
+            if !response.status().is_success() {
+                continue;
+            }
+
+            let body = match response.text().await {
+                Ok(body) => body,
+                Err(_) => continue,
+            };
+            let Ok(json) = serde_json::from_str::<Value>(&body) else {
+                continue;
+            };
+            if let Some(summary) = summarize_quota_payload(&json) {
+                return Some(summary);
+            }
+        }
+
+        None
+    }
+
     async fn send_responses_request(
         &self,
         input: Vec<ResponsesInput>,
         instructions: String,
         model: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<CodexResponseMetadata> {
         let use_gateway_api_key_auth = self.custom_endpoint && self.gateway_api_key.is_some();
         let profile = match self
             .auth
@@ -641,7 +964,37 @@ impl OpenAiCodexProvider {
             return Err(super::api_error("OpenAI Codex", response).await);
         }
 
-        decode_responses_body(response).await
+        let header_rate_limit_summary = codex_rate_limit_summary_from_headers(response.headers());
+        let mut decoded = decode_responses_body_with_metadata(response).await?;
+        let quota_summary = self
+            .fetch_codex_quota_summary(
+                access_token.as_deref().unwrap_or_default(),
+                account_id.as_deref().unwrap_or_default(),
+            )
+            .await;
+        decoded.rate_limit_summary = match (header_rate_limit_summary, decoded.rate_limit_summary) {
+            (Some(h), Some(s)) => Some(format!("{h}; {s}")),
+            (Some(h), None) => Some(h),
+            (None, Some(s)) => Some(s),
+            (None, None) => None,
+        };
+        decoded.rate_limit_summary = match (decoded.rate_limit_summary, quota_summary) {
+            (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        if let Some(summary) = decoded.rate_limit_summary.as_deref() {
+            tracing::info!(
+                provider = "openai-codex",
+                rate_limit_summary = %summary,
+                "Captured provider rate-limit metadata"
+            );
+        }
+        Ok(CodexResponseMetadata {
+            text: decoded.text,
+            rate_limit_summary: decoded.rate_limit_summary,
+        })
     }
 }
 
@@ -675,6 +1028,7 @@ impl Provider for OpenAiCodexProvider {
         let (instructions, input) = build_responses_input(&prepared.messages);
         self.send_responses_request(input, instructions, model)
             .await
+            .map(|result| result.text)
     }
 
     async fn chat_with_history(
@@ -690,12 +1044,38 @@ impl Provider for OpenAiCodexProvider {
         let (instructions, input) = build_responses_input(&prepared.messages);
         self.send_responses_request(input, instructions, model)
             .await
+            .map(|result| result.text)
+    }
+
+    async fn chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        let (instructions, input) = build_responses_input(request.messages);
+        let result = self
+            .send_responses_request(input, instructions, model)
+            .await?;
+        Ok(ChatResponse {
+            text: Some(result.text),
+            tool_calls: Vec::new(),
+            usage: result.rate_limit_summary.map(|summary| TokenUsage {
+                input_tokens: None,
+                output_tokens: None,
+                token_limit: None,
+                token_remaining: None,
+                rate_limit_summary: Some(summary),
+            }),
+            reasoning_content: None,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ProviderRuntimeOptions;
     use std::sync::{Mutex, OnceLock};
 
     struct EnvGuard {
@@ -752,6 +1132,24 @@ mod tests {
             output_text: None,
         };
         assert_eq!(extract_responses_text(&response).as_deref(), Some("nested"));
+    }
+
+    #[test]
+    fn build_responses_input_converts_image_markers_to_input_image_blocks() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Describe this\n\n[IMAGE:data:image/png;base64,abcd]".to_string(),
+        }];
+
+        let (_, input) = build_responses_input(&messages);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0].content.len(), 2);
+        assert_eq!(input[0].content[0].kind, "input_text");
+        assert_eq!(input[0].content[1].kind, "input_image");
+        assert_eq!(
+            input[0].content[1].image_url.as_deref(),
+            Some("data:image/png;base64,abcd")
+        );
     }
 
     #[test]
@@ -923,6 +1321,18 @@ mod tests {
     }
 
     #[test]
+    fn resolve_reasoning_effort_prefers_runtime_override() {
+        assert_eq!(
+            resolve_reasoning_effort("gpt-5-codex", Some("minimal")),
+            "low".to_string()
+        );
+        assert_eq!(
+            resolve_reasoning_effort("gpt-5.3-codex", Some("xhigh")),
+            "xhigh".to_string()
+        );
+    }
+
+    #[test]
     fn parse_sse_text_reads_output_text_delta() {
         let payload = r#"data: {"type":"response.created","response":{"id":"resp_123"}}
 
@@ -1082,6 +1492,7 @@ data: [DONE]
             auth_profile_override: None,
             reasoning_enabled: None,
             reasoning_level: None,
+            reasoning_effort: None,
             custom_provider_api_mode: None,
             max_tokens_override: None,
             model_support_vision: None,
@@ -1092,5 +1503,156 @@ data: [DONE]
 
         assert!(!caps.native_tool_calling);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn summarize_quota_payload_prefers_codex_usage_windows() {
+        let payload = serde_json::json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 37,
+                    "reset_after_seconds": 1498,
+                    "reset_at": 1772036101
+                },
+                "secondary_window": {
+                    "used_percent": 98,
+                    "reset_after_seconds": 98099,
+                    "reset_at": 1772132702
+                }
+            }
+        });
+
+        let summary = summarize_quota_payload(&payload).expect("quota summary");
+        assert!(summary.contains("5h remaining=63% (used=37%"));
+        assert!(summary.contains("weekly remaining=2% (used=98%"));
+    }
+
+    #[tokio::test]
+    #[ignore = "Live diagnostic probe for OpenAI Codex account quota endpoints"]
+    async fn openai_codex_live_quota_endpoint_probe() {
+        if std::env::var("ZEROCLAW_LIVE_QUOTA_PROBE").ok().as_deref() != Some("1") {
+            eprintln!("Skipping live probe. Set ZEROCLAW_LIVE_QUOTA_PROBE=1 to run.");
+            return;
+        }
+
+        let options = ProviderRuntimeOptions::default();
+        let state_dir = options
+            .zeroclaw_dir
+            .clone()
+            .unwrap_or_else(default_zeroclaw_dir);
+        let auth = AuthService::new(&state_dir, options.secrets_encrypt);
+        let profile = auth
+            .get_profile("openai-codex", options.auth_profile_override.as_deref())
+            .await
+            .unwrap()
+            .unwrap();
+        let access_token = auth
+            .get_valid_openai_access_token(options.auth_profile_override.as_deref())
+            .await
+            .unwrap()
+            .unwrap();
+        let account_id = profile
+            .account_id
+            .or_else(|| extract_account_id_from_jwt(&access_token))
+            .expect("account id");
+
+        let endpoints = [
+            ("GET", "https://chatgpt.com/backend-api/codex/rate_limits"),
+            ("GET", "https://chatgpt.com/backend-api/codex/limits"),
+            ("GET", "https://chatgpt.com/backend-api/codex/usage"),
+            ("GET", "https://chatgpt.com/backend-api/usage_limits"),
+            ("GET", "https://chatgpt.com/backend-api/limits"),
+            (
+                "GET",
+                "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
+            ),
+            (
+                "GET",
+                "https://chatgpt.com/backend-api/accounts/check/v4-2025-02-27",
+            ),
+            ("GET", "https://chatgpt.com/backend-api/accounts/check"),
+            ("GET", "https://chatgpt.com/backend-api/accounts"),
+            ("GET", "https://chatgpt.com/backend-api/me"),
+            (
+                "GET",
+                "https://chatgpt.com/backend-api/settings/beta_features",
+            ),
+            ("GET", "https://chatgpt.com/backend-api/models"),
+            ("GET", "https://chatgpt.com/backend-api/codex/client_state"),
+            ("GET", "https://chatgpt.com/backend-api/codex/session"),
+            ("GET", "https://chatgpt.com/backend-api/codex/entitlements"),
+            ("GET", "https://chatgpt.com/backend-api/codex/availability"),
+        ];
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let mut codex_usage_verified = false;
+        for (method, url) in endpoints {
+            let request = match method {
+                "GET" => client.get(url),
+                _ => unreachable!(),
+            };
+            let response = request
+                .header("Authorization", format!("Bearer {access_token}"))
+                .header("chatgpt-account-id", account_id.clone())
+                .header("accept", "application/json")
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = response.text().await.unwrap_or_default();
+            let json_keys = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .as_object()
+                        .map(|obj| obj.keys().cloned().collect::<Vec<_>>())
+                })
+                .unwrap_or_default();
+            eprintln!(
+                "LIVE_PROBE url={url} status={} root_keys={:?}",
+                status.as_u16(),
+                json_keys
+            );
+            if let Some(summary) = summarize_quota_payload(
+                &serde_json::from_str::<Value>(&body).unwrap_or(Value::Null),
+            ) {
+                eprintln!("LIVE_PROBE quota_summary url={url} summary={summary}");
+                if url.ends_with("/codex/usage") && summary.contains("weekly remaining=") {
+                    codex_usage_verified = true;
+                }
+            }
+            let interesting_headers: Vec<String> = headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    let key = name.as_str().to_ascii_lowercase();
+                    if key.contains("ratelimit")
+                        || key.contains("rate-limit")
+                        || key.contains("quota")
+                        || key.contains("limit")
+                        || key.contains("remaining")
+                    {
+                        Some(format!("{key}={}", value.to_str().unwrap_or("<binary>")))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !interesting_headers.is_empty() {
+                eprintln!(
+                    "LIVE_PROBE headers url={url} headers={}",
+                    interesting_headers.join("; ")
+                );
+            }
+        }
+
+        assert!(
+            codex_usage_verified,
+            "expected /backend-api/codex/usage to expose weekly/5h quota summary"
+        );
     }
 }
