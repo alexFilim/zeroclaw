@@ -721,7 +721,17 @@ fn extract_stream_error_message(event: &Value) -> Option<String> {
 }
 
 async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<String> {
-    let body = response.text().await?;
+    let status = response.status();
+    // Use bytes() so an invalid-UTF-8 or truncated body doesn't hide the content.
+    // from_utf8_lossy replaces bad bytes with U+FFFD rather than erroring.
+    let bytes = response.bytes().await?;
+    let body = String::from_utf8_lossy(&bytes);
+    tracing::debug!(
+        status = %status,
+        body_bytes = bytes.len(),
+        body = %body.chars().take(500).collect::<String>(),
+        "OpenAI Codex raw response body"
+    );
 
     if let Some(text) = parse_sse_text(&body)? {
         return Ok(text);
@@ -748,7 +758,15 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<St
 async fn decode_responses_body_with_metadata(
     response: reqwest::Response,
 ) -> anyhow::Result<CodexResponseMetadata> {
-    let body = response.text().await?;
+    let status = response.status();
+    let bytes = response.bytes().await?;
+    let body = String::from_utf8_lossy(&bytes);
+    tracing::debug!(
+        status = %status,
+        body_bytes = bytes.len(),
+        body = %body.chars().take(500).collect::<String>(),
+        "OpenAI Codex raw response body"
+    );
     let sse_rate_limit_summary = parse_sse_rate_limit_summary(&body);
 
     let text = if let Some(text) = parse_sse_text(&body)? {
