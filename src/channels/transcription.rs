@@ -33,9 +33,14 @@ fn normalize_audio_filename(file_name: &str) -> String {
 
 /// Transcribe audio bytes via a Whisper-compatible transcription API.
 ///
-/// Returns the transcribed text on success.  Requires `GROQ_API_KEY` in the
-/// environment.  The caller is responsible for enforcing duration limits
-/// *before* downloading the file; this function enforces the byte-size cap.
+/// Returns the transcribed text on success.
+///
+/// Credential resolution order:
+/// 1. `config.transcription.api_key`
+/// 2. `GROQ_API_KEY` environment variable (backward compatibility)
+///
+/// The caller is responsible for enforcing duration limits *before* downloading
+/// the file; this function enforces the byte-size cap.
 pub async fn transcribe_audio(
     audio_data: Vec<u8>,
     file_name: &str,
@@ -60,13 +65,23 @@ pub async fn transcribe_audio(
         )
     })?;
 
-    let api_key = std::env::var("GROQ_API_KEY")
-        .ok()
+    let api_key = configured_api_key
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(ToString::to_string)
         .or_else(|| {
-            configured_api_key
+            config
+                .api_key
+                .as_deref()
                 .map(str::trim)
                 .filter(|key| !key.is_empty())
                 .map(ToString::to_string)
+        })
+        .or_else(|| {
+            std::env::var("GROQ_API_KEY")
+                .ok()
+                .map(|key| key.trim().to_string())
+                .filter(|key| !key.is_empty())
         })
         .or_else(|| {
             std::env::var("ZEROCLAW_API_KEY")
@@ -81,7 +96,7 @@ pub async fn transcribe_audio(
                 .filter(|key| !key.is_empty())
         })
         .context(
-            "No transcription API key found. Set GROQ_API_KEY, or configure api_key in config.toml",
+            "Missing transcription API key: set [transcription].api_key or GROQ_API_KEY environment variable",
         )?;
 
     let client = crate::config::build_runtime_proxy_client("transcription.groq");
@@ -146,7 +161,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_missing_api_key() {
-        // Ensure the key is absent for this test
+        // Ensure fallback env key is absent for this test.
         std::env::remove_var("GROQ_API_KEY");
 
         let data = vec![0u8; 100];
@@ -156,8 +171,26 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("No transcription API key found"),
+            err.to_string().contains("transcription API key"),
             "expected missing-key error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn uses_config_api_key_without_groq_env() {
+        std::env::remove_var("GROQ_API_KEY");
+
+        let data = vec![0u8; 100];
+        let mut config = TranscriptionConfig::default();
+        config.api_key = Some("transcription-key".to_string());
+
+        // Keep invalid extension so we fail before network, but after key resolution.
+        let err = transcribe_audio(data, "recording.aac", &config)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported audio format"),
+            "expected unsupported-format error, got: {err}"
         );
     }
 
