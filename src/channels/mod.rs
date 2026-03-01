@@ -212,6 +212,7 @@ enum ChannelRuntimeCommand {
     ApproveDomain(String),
     DenyDomain(String),
     RestartService,
+    PermissionsUnsafe,
 }
 
 const APPROVAL_ALL_TOOLS_ONCE_TOKEN: &str = "__all_tools_once__";
@@ -892,6 +893,10 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         "/restart" => Some(ChannelRuntimeCommand::RestartService),
         "/approve-domain" => Some(ChannelRuntimeCommand::ApproveDomain(tail.clone())),
         "/deny-domain" => Some(ChannelRuntimeCommand::DenyDomain(tail)),
+        "/permissions" => match tail.trim() {
+            "unsafe" => Some(ChannelRuntimeCommand::PermissionsUnsafe),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -3428,6 +3433,33 @@ async fn handle_runtime_command_if_needed(
                         )
                     }
                 }
+            }
+        }
+        ChannelRuntimeCommand::PermissionsUnsafe => {
+            if !ctx
+                .approval_manager
+                .is_non_cli_approval_actor_allowed(source_channel, sender)
+            {
+                "Not authorized to change permission settings.".to_string()
+            } else {
+                let remaining = ctx.approval_manager.grant_non_cli_allow_all_once();
+                runtime_trace::record_event(
+                    "permissions_unsafe_granted",
+                    Some(source_channel),
+                    None,
+                    None,
+                    None,
+                    Some(true),
+                    Some("one-time all-tools bypass granted via /permissions unsafe"),
+                    serde_json::json!({
+                        "sender": sender,
+                        "channel": source_channel,
+                        "remaining_tokens": remaining,
+                    }),
+                );
+                format!(
+                    "⚠️ Unsafe mode: all tool approvals bypassed for the next agent turn.\nQueued bypass tokens: `{remaining}`.\nThis is a one-time bypass and does not persist to config."
+                )
             }
         }
         ChannelRuntimeCommand::RestartService => match maybe_restart_managed_daemon_service() {
