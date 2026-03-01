@@ -1163,6 +1163,21 @@ fn snapshot_show_internal_tool_logs(ctx: &ChannelRuntimeContext) -> bool {
     true
 }
 
+fn runtime_perplexity_filter_snapshot(
+    ctx: &ChannelRuntimeContext,
+) -> crate::config::PerplexityFilterConfig {
+    if let Some(config_path) = runtime_config_path(ctx) {
+        let store = runtime_config_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = store.get(&config_path) {
+            return state.perplexity_filter.clone();
+        }
+    }
+
+    crate::config::PerplexityFilterConfig::default()
+}
+
 fn filtered_tool_specs_for_runtime(
     tools_registry: &[Box<dyn Tool>],
     excluded_tools: &[String],
@@ -3314,6 +3329,106 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::DenyDomain(raw_domain) => {
             build_domain_policy_update_response(&raw_domain, DomainListKind::Deny)
+        }
+        ChannelRuntimeCommand::ApprovePendingRequest(raw_request_id) => {
+            let request_id = raw_request_id.trim().to_string();
+            if request_id.is_empty() {
+                "Usage: `/approve-allow <request-id>`".to_string()
+            } else {
+                match ctx.approval_manager.confirm_non_cli_pending_request(
+                    &request_id,
+                    sender,
+                    source_channel,
+                    reply_target,
+                ) {
+                    Ok(req) => {
+                        let tool_name = req.tool_name;
+                        ctx.approval_manager
+                            .record_non_cli_pending_resolution(&request_id, ApprovalResponse::Yes);
+                        runtime_trace::record_event(
+                            "approval_request_allowed",
+                            Some(source_channel),
+                            None,
+                            None,
+                            None,
+                            Some(true),
+                            Some("pending request allowed via approve-allow"),
+                            serde_json::json!({
+                                "request_id": request_id,
+                                "tool_name": tool_name,
+                                "sender": sender,
+                                "channel": source_channel,
+                            }),
+                        );
+                        format!(
+                            "Approved pending request `{request_id}` for tool `{tool_name}`."
+                        )
+                    }
+                    Err(PendingApprovalError::NotFound) => {
+                        format!(
+                            "Pending approval request `{request_id}` was not found."
+                        )
+                    }
+                    Err(PendingApprovalError::Expired) => {
+                        format!("Pending approval request `{request_id}` has expired.")
+                    }
+                    Err(PendingApprovalError::RequesterMismatch) => {
+                        format!(
+                            "Pending approval request `{request_id}` can only be approved by the same sender in the same chat/channel that created it."
+                        )
+                    }
+                }
+            }
+        }
+        ChannelRuntimeCommand::DenyToolApproval(raw_request_id) => {
+            let request_id = raw_request_id.trim().to_string();
+            if request_id.is_empty() {
+                "Usage: `/approve-deny <request-id>`".to_string()
+            } else {
+                match ctx.approval_manager.reject_non_cli_pending_request(
+                    &request_id,
+                    sender,
+                    source_channel,
+                    reply_target,
+                ) {
+                    Ok(req) => {
+                        let tool_name = req.tool_name;
+                        ctx.approval_manager
+                            .record_non_cli_pending_resolution(&request_id, ApprovalResponse::No);
+                        runtime_trace::record_event(
+                            "approval_request_denied",
+                            Some(source_channel),
+                            None,
+                            None,
+                            None,
+                            Some(false),
+                            Some("pending request denied via approve-deny"),
+                            serde_json::json!({
+                                "request_id": request_id,
+                                "tool_name": tool_name,
+                                "sender": sender,
+                                "channel": source_channel,
+                            }),
+                        );
+                        format!(
+                            "Denied pending request `{request_id}` for tool `{tool_name}`."
+                        )
+                    }
+                    Err(PendingApprovalError::NotFound) => {
+                        format!(
+                            "Pending approval request `{request_id}` was not found."
+                        )
+                    }
+                    Err(PendingApprovalError::Expired) => {
+                        format!("Pending approval request `{request_id}` has expired.")
+                    }
+                    Err(PendingApprovalError::RequesterMismatch) => {
+                        format!(
+                            "Pending approval request `{request_id}` can only be denied by the same sender in the same chat/channel that created it."
+                        )
+                    }
+                }
+            }
         }
         ChannelRuntimeCommand::RestartService => match maybe_restart_managed_daemon_service() {
             Ok(true) => "Restart requested. Managed daemon service is restarting now.".to_string(),

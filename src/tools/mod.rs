@@ -53,6 +53,7 @@ pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
+pub mod docx_read;
 pub mod pdf_read;
 pub mod process;
 pub mod proxy_config;
@@ -86,6 +87,7 @@ pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
 pub use delegate_coordination_status::DelegateCoordinationStatusTool;
+pub use docx_read::DocxReadTool;
 #[cfg(feature = "channel-lark")]
 pub use feishu_doc::FeishuDocTool;
 pub use file_edit::FileEditTool;

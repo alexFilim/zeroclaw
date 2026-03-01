@@ -1227,7 +1227,7 @@ impl OpenAiCodexProvider {
             )));
         }
 
-        Err(WebsocketRequestError::stream(anyhow::anyhow!(
+        Err(WebsocketRequestError::transport_unavailable(anyhow::anyhow!(
             "No response from OpenAI Codex websocket stream"
         )))
     }
@@ -1239,7 +1239,7 @@ impl OpenAiCodexProvider {
         account_id: Option<&str>,
         access_token: Option<&str>,
         use_gateway_api_key_auth: bool,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<CodexResponseMetadata> {
         let mut request_builder = self
             .client
             .post(&self.responses_url)
@@ -1268,7 +1268,7 @@ impl OpenAiCodexProvider {
             return Err(super::api_error("OpenAI Codex", response).await);
         }
 
-        decode_responses_body(response).await
+        decode_responses_body_with_metadata(response).await
     }
 
     async fn send_responses_request(
@@ -1369,6 +1369,7 @@ impl OpenAiCodexProvider {
                     use_gateway_api_key_auth,
                 )
                 .await
+                .map(|text| CodexResponseMetadata { text, rate_limit_summary: None })
                 .map_err(Into::into),
             CodexTransport::Sse => {
                 self.send_responses_sse_request(
@@ -1392,7 +1393,7 @@ impl OpenAiCodexProvider {
                     )
                     .await
                 {
-                    Ok(text) => Ok(text),
+                    Ok(text) => Ok(CodexResponseMetadata { text, rate_limit_summary: None }),
                     Err(WebsocketRequestError::TransportUnavailable(error)) => {
                         tracing::warn!(
                             error = %error,
