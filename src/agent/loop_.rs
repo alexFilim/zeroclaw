@@ -86,6 +86,18 @@ const SLASH_COMMANDS: &[(&[&str], &str, &str)] = &[
         "Clear conversation history",
     ),
     (&["/quit", "/exit"], "/quit /exit", "Exit interactive mode"),
+    (
+        &[
+            "/permissions",
+            "/permissions ask",
+            "/permissions yes",
+            "/permissions no",
+            "/permissions always",
+            "/permissions unsafe",
+        ],
+        "/permissions [ask|yes|no|always|unsafe]",
+        "Show or change the session approval mode",
+    ),
 ];
 
 struct SlashCommandCompleter;
@@ -2146,9 +2158,16 @@ pub async fn run(
                 "/quit" | "/exit" => break,
                 "/help" => {
                     println!("Available commands:");
-                    println!("  /help        Show this help message");
-                    println!("  /clear /new  Clear conversation history");
-                    println!("  /quit /exit  Exit interactive mode\n");
+                    println!("  /help                              Show this help message");
+                    println!("  /clear /new                        Clear conversation history");
+                    println!("  /quit /exit                        Exit interactive mode");
+                    println!("  /permissions [ask|yes|no|always|unsafe]");
+                    println!("                                     Show or change the session approval mode");
+                    println!("    ask    — interactive prompt for each tool call (default)");
+                    println!("    yes    — auto-approve each call once");
+                    println!("    no     — auto-deny all tool calls");
+                    println!("    always — auto-approve and add every tool to the session allowlist");
+                    println!("    unsafe — skip all approval checks entirely\n");
                     continue;
                 }
                 "/clear" | "/new" => {
@@ -2181,6 +2200,81 @@ pub async fn run(
                         println!("Conversation cleared ({cleared} memory entries removed).\n");
                     } else {
                         println!("Conversation cleared.\n");
+                    }
+                    continue;
+                }
+                cmd if cmd.starts_with("/permissions") => {
+                    let arg = cmd
+                        .strip_prefix("/permissions")
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase();
+
+                    let mgr = approval_manager.as_ref();
+
+                    match arg.as_str() {
+                        "" => {
+                            // Show current mode.
+                            match mgr {
+                                None => println!("Approval manager not active in this mode.\n"),
+                                Some(m) => {
+                                    let mode = if m.is_session_bypass_all() {
+                                        "unsafe (all checks bypassed)"
+                                    } else {
+                                        match m.session_auto_respond() {
+                                            Some(ApprovalResponse::Yes) => "yes (auto-approve once)",
+                                            Some(ApprovalResponse::No) => "no (auto-deny)",
+                                            Some(ApprovalResponse::Always) => {
+                                                "always (auto-approve + allowlist)"
+                                            }
+                                            Some(ApprovalResponse::AllowAll) | None => {
+                                                "ask (interactive prompt)"
+                                            }
+                                        }
+                                    };
+                                    println!("Current approval mode: {mode}\n");
+                                }
+                            }
+                        }
+                        "ask" => {
+                            if let Some(m) = mgr {
+                                m.set_session_bypass_all(false);
+                                m.set_session_auto_respond(None);
+                            }
+                            println!("Approval mode: ask — you will be prompted for each tool call.\n");
+                        }
+                        "yes" => {
+                            if let Some(m) = mgr {
+                                m.set_session_bypass_all(false);
+                                m.set_session_auto_respond(Some(ApprovalResponse::Yes));
+                            }
+                            println!("Approval mode: yes — all tool calls will be auto-approved once.\n");
+                        }
+                        "no" => {
+                            if let Some(m) = mgr {
+                                m.set_session_bypass_all(false);
+                                m.set_session_auto_respond(Some(ApprovalResponse::No));
+                            }
+                            println!("Approval mode: no — all tool calls will be auto-denied.\n");
+                        }
+                        "always" => {
+                            if let Some(m) = mgr {
+                                m.set_session_bypass_all(false);
+                                m.set_session_auto_respond(Some(ApprovalResponse::Always));
+                            }
+                            println!("Approval mode: always — all tool calls will be approved and added to the session allowlist.\n");
+                        }
+                        "unsafe" => {
+                            if let Some(m) = mgr {
+                                m.set_session_auto_respond(None);
+                                m.set_session_bypass_all(true);
+                            }
+                            println!("Approval mode: unsafe — all approval checks bypassed for this session.\n");
+                        }
+                        _ => {
+                            println!("Unknown permission mode: '{arg}'.");
+                            println!("Usage: /permissions [ask|yes|no|always|unsafe]\n");
+                        }
                     }
                     continue;
                 }

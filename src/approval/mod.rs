@@ -31,6 +31,9 @@ pub enum ApprovalResponse {
     No,
     /// Execute and add tool to session-scoped allowlist.
     Always,
+    /// Execute and bypass all approval prompts for the rest of the session.
+    #[serde(rename = "allow_all")]
+    AllowAll,
 }
 
 /// A single audit log entry for an approval decision.
@@ -79,6 +82,11 @@ pub struct ApprovalManager {
     autonomy_level: AutonomyLevel,
     /// Session-scoped allowlist built from "Always" responses.
     session_allowlist: Mutex<HashSet<String>>,
+    /// Session-scoped bypass flag set by "AllowAll" response — skips all further prompts.
+    session_bypass_all: Mutex<bool>,
+    /// Session-scoped auto-respond mode: when set, all prompts are answered automatically
+    /// without user interaction.
+    session_auto_respond: Mutex<Option<ApprovalResponse>>,
     /// Session-scoped allowlist for non-CLI channels after explicit human approval.
     non_cli_allowlist: Mutex<HashSet<String>>,
     /// One-time non-CLI bypass tokens that allow a full tool loop turn without prompts.
@@ -131,6 +139,8 @@ impl ApprovalManager {
             always_ask: RwLock::new(config.always_ask.iter().cloned().collect()),
             autonomy_level: config.level,
             session_allowlist: Mutex::new(HashSet::new()),
+            session_bypass_all: Mutex::new(false),
+            session_auto_respond: Mutex::new(None),
             non_cli_allowlist: Mutex::new(HashSet::new()),
             non_cli_allow_all_once_remaining: Mutex::new(0),
             non_cli_approval_approvers: RwLock::new(Self::normalize_non_cli_approvers(
@@ -161,6 +171,11 @@ impl ApprovalManager {
 
         // ReadOnly blocks everything — handled elsewhere; no prompt needed.
         if self.autonomy_level == AutonomyLevel::ReadOnly {
+            return false;
+        }
+
+        // Session-wide bypass set by an "AllowAll" response.
+        if *self.session_bypass_all.lock() {
             return false;
         }
 
@@ -198,6 +213,11 @@ impl ApprovalManager {
             allowlist.insert(tool_name.to_string());
         }
 
+        // If "AllowAll", enable session-wide bypass.
+        if decision == ApprovalResponse::AllowAll {
+            *self.session_bypass_all.lock() = true;
+        }
+
         // Append to audit log.
         let summary = summarize_args(args);
         let entry = ApprovalLogEntry {
@@ -219,6 +239,29 @@ impl ApprovalManager {
     /// Get the current session allowlist.
     pub fn session_allowlist(&self) -> HashSet<String> {
         self.session_allowlist.lock().clone()
+    }
+
+    /// Set or clear the session-wide bypass flag (used by `/permissions unsafe` / `ask`).
+    pub fn set_session_bypass_all(&self, val: bool) {
+        *self.session_bypass_all.lock() = val;
+    }
+
+    /// Whether the session-wide bypass flag is active.
+    pub fn is_session_bypass_all(&self) -> bool {
+        *self.session_bypass_all.lock()
+    }
+
+    /// Set a session-scoped auto-respond mode.
+    ///
+    /// When `Some(response)`, every approval prompt is answered automatically with
+    /// that response.  Pass `None` to return to interactive prompting.
+    pub fn set_session_auto_respond(&self, mode: Option<ApprovalResponse>) {
+        *self.session_auto_respond.lock() = mode;
+    }
+
+    /// Current session auto-respond mode.
+    pub fn session_auto_respond(&self) -> Option<ApprovalResponse> {
+        *self.session_auto_respond.lock()
     }
 
     /// Grant session-scoped non-CLI approval for a specific tool.
@@ -581,9 +624,12 @@ impl ApprovalManager {
 
     /// Prompt the user on the CLI and return their decision.
     ///
-    /// For non-CLI channels, returns `Yes` automatically (interactive
-    /// approval is only supported on CLI for now).
+    /// Returns the session auto-respond mode immediately when set, otherwise
+    /// falls back to the interactive stdin prompt.
     pub fn prompt_cli(&self, request: &ApprovalRequest) -> ApprovalResponse {
+        if let Some(auto) = *self.session_auto_respond.lock() {
+            return auto;
+        }
         prompt_cli_interactive(request)
     }
 }
@@ -596,7 +642,10 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
     eprintln!();
     eprintln!("🔧 Agent wants to execute: {}", request.tool_name);
     eprintln!("   {summary}");
-    eprint!("   [Y]es / [N]o / [A]lways for {}: ", request.tool_name);
+    eprint!(
+        "   [Y]es / [N]o / [A]lways for {} / [U]nsafe (skip all): ",
+        request.tool_name
+    );
     let _ = io::stderr().flush();
 
     let stdin = io::stdin();
@@ -608,6 +657,7 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
     match line.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" => ApprovalResponse::Yes,
         "a" | "always" => ApprovalResponse::Always,
+        "u" | "unsafe" => ApprovalResponse::AllowAll,
         _ => ApprovalResponse::No,
     }
 }
@@ -1053,6 +1103,123 @@ mod tests {
             mgr.non_cli_natural_language_approval_mode_for_channel("slack"),
             NonCliNaturalLanguageApprovalMode::Direct
         );
+    }
+
+    // ── AllowAll / session bypass ────────────────────────────
+
+    #[test]
+    fn allow_all_response_sets_session_bypass() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        assert!(mgr.needs_approval("file_write"));
+        assert!(mgr.needs_approval("shell"));
+
+        mgr.record_decision(
+            "shell",
+            &serde_json::json!({"command": "ls"}),
+            ApprovalResponse::AllowAll,
+            "cli",
+        );
+
+        assert!(!mgr.needs_approval("file_write"));
+        assert!(!mgr.needs_approval("shell"));
+        assert!(!mgr.needs_approval("any_other_tool"));
+    }
+
+    #[test]
+    fn allow_all_does_not_affect_full_autonomy_path() {
+        let mgr = ApprovalManager::from_config(&full_config());
+        // Full autonomy already skips prompts; AllowAll is a no-op addition.
+        assert!(!mgr.needs_approval("shell"));
+        mgr.record_decision(
+            "shell",
+            &serde_json::json!({}),
+            ApprovalResponse::AllowAll,
+            "cli",
+        );
+        assert!(!mgr.needs_approval("shell"));
+    }
+
+    #[test]
+    fn allow_all_serde_roundtrip() {
+        let json = serde_json::to_string(&ApprovalResponse::AllowAll).unwrap();
+        assert_eq!(json, "\"allow_all\"");
+        let parsed: ApprovalResponse = serde_json::from_str("\"allow_all\"").unwrap();
+        assert_eq!(parsed, ApprovalResponse::AllowAll);
+    }
+
+    // ── session_auto_respond ─────────────────────────────────
+
+    #[test]
+    fn set_session_auto_respond_yes_returns_yes_from_prompt_cli() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        assert!(mgr.session_auto_respond().is_none());
+
+        mgr.set_session_auto_respond(Some(ApprovalResponse::Yes));
+
+        let req = ApprovalRequest {
+            tool_name: "shell".into(),
+            arguments: serde_json::json!({}),
+        };
+        assert_eq!(mgr.prompt_cli(&req), ApprovalResponse::Yes);
+    }
+
+    #[test]
+    fn set_session_auto_respond_no_returns_no_from_prompt_cli() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        mgr.set_session_auto_respond(Some(ApprovalResponse::No));
+
+        let req = ApprovalRequest {
+            tool_name: "shell".into(),
+            arguments: serde_json::json!({}),
+        };
+        assert_eq!(mgr.prompt_cli(&req), ApprovalResponse::No);
+    }
+
+    #[test]
+    fn set_session_auto_respond_always_adds_to_allowlist_via_record() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        mgr.set_session_auto_respond(Some(ApprovalResponse::Always));
+
+        // Simulate what the tool loop does: prompt then record.
+        let req = ApprovalRequest {
+            tool_name: "file_write".into(),
+            arguments: serde_json::json!({}),
+        };
+        let decision = mgr.prompt_cli(&req);
+        assert_eq!(decision, ApprovalResponse::Always);
+        mgr.record_decision("file_write", &serde_json::json!({}), decision, "cli");
+
+        // After one cycle file_write is in the session allowlist.
+        assert!(!mgr.needs_approval("file_write"));
+    }
+
+    #[test]
+    fn set_session_auto_respond_none_restores_interactive_mode() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        mgr.set_session_auto_respond(Some(ApprovalResponse::Yes));
+        assert_eq!(mgr.session_auto_respond(), Some(ApprovalResponse::Yes));
+
+        mgr.set_session_auto_respond(None);
+        assert_eq!(mgr.session_auto_respond(), None);
+    }
+
+    #[test]
+    fn set_session_bypass_all_false_restores_prompting() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        mgr.set_session_bypass_all(true);
+        assert!(!mgr.needs_approval("shell"));
+
+        mgr.set_session_bypass_all(false);
+        assert!(mgr.needs_approval("shell"));
+    }
+
+    #[test]
+    fn permissions_unsafe_overrides_auto_respond() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        // Setting unsafe bypasses needs_approval entirely — prompt_cli is never reached.
+        mgr.set_session_auto_respond(Some(ApprovalResponse::No));
+        mgr.set_session_bypass_all(true);
+        assert!(!mgr.needs_approval("shell"));
     }
 
     // ── audit log ────────────────────────────────────────────
